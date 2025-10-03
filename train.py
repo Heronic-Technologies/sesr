@@ -1,11 +1,11 @@
 # Copyright 2021 Arm Inc. All Rights Reserved.
-# 
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
-# 
+#
 # http://www.apache.org/licenses/LICENSE-2.0
-# 
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -16,6 +16,8 @@
 
 from typing import Callable, List, Tuple
 import os
+import onnx
+import tf2onnx
 import tensorflow as tf
 import tensorflow_datasets as tfds
 import atexit
@@ -48,10 +50,10 @@ SUFFIX = 'QAT' if (FLAGS.quant_W and FLAGS.quant_A) else 'FP32'
 if FLAGS.scale == 4: #Specify path to load x2 models (x4 SISR will only finetune x2 models)
   if FLAGS.model_name == 'SESR':
     PATH_2X = 'logs/x2_models/'+FLAGS.model_name+'_m{}_f{}_x2_fs{}_{}Training_{}'.format(
-                                                                  FLAGS.m, 
+                                                                  FLAGS.m,
                                                                   FLAGS.int_features,
                                                                   FLAGS.feature_size,
-                                                                  FLAGS.linear_block_type, 
+                                                                  FLAGS.linear_block_type,
                                                                   SUFFIX)
 
 
@@ -64,7 +66,7 @@ def main(unused_argv):
 
     data_dir = os.getenv("TFDS_DATA_DIR", None)
 
-    dataset_train, dataset_validation = tfds.load(DATASET_NAME, 
+    dataset_train, dataset_validation = tfds.load(DATASET_NAME,
                                    split=['train', 'validation'], shuffle_files=True,
                                    data_dir=data_dir)
     dataset_train = dataset_train.prefetch(buffer_size=tf.data.experimental.AUTOTUNE)
@@ -95,11 +97,11 @@ def main(unused_argv):
             quant_A=FLAGS.quant_A > 0,
             gen_tflite = FLAGS.gen_tflite,
             mode='train')
-    
+
         #Declare the optimizer.
-        optimizer = tf.keras.optimizers.Adam(learning_rate=FLAGS.learning_rate, 
+        optimizer = tf.keras.optimizers.Adam(learning_rate=FLAGS.learning_rate,
                                           amsgrad=True)
-    
+
         #If scale == 4, base x2 model must be loaded for transfer learning.
         #Load the pretrained weights into the base model from x2 SISR:
         if FLAGS.scale == 4:
@@ -114,24 +116,33 @@ def main(unused_argv):
 
         #Compile and train the model.
         model.compile(optimizer=optimizer, loss='mae', metrics=[psnr])
-    
-    model.fit(dataset_train.batch(FLAGS.batch_size), 
-              epochs=FLAGS.epochs, 
-              validation_data=dataset_validation.batch(1), 
+
+    model.fit(dataset_train.batch(FLAGS.batch_size),
+              epochs=FLAGS.epochs,
+              validation_data=dataset_validation.batch(1),
               validation_freq=1)
     model.summary()
 
     #Save the trained models.
     if FLAGS.model_name == 'SESR':
       final_save_path = BASE_SAVE_DIR+FLAGS.model_name+'_m{}_f{}_x{}_fs{}_{}Training_{}'.format(
-                           FLAGS.m, FLAGS.int_features, FLAGS.scale, FLAGS.feature_size, 
+                           FLAGS.m, FLAGS.int_features, FLAGS.scale, FLAGS.feature_size,
                            FLAGS.linear_block_type, SUFFIX)
       model.save(final_save_path)
       model.save_weights(final_save_path + '/model_weights')
 
+      # convert to ONNX
+      spec = [tf.TensorSpec((1, None, None, 1), tf.float32, name="input_1")]
+      output_path = final_save_path + '/model.onnx'
+      tf2onnx.convert.from_keras(model, input_signature=spec, opset=13,
+                                      output_path=output_path, inputs_as_nchw=["input_1"],
+                                      outputs_as_nchw=["output_1"])
+
+
+
       #Get the TFLITE for custom image size
       if FLAGS.gen_tflite:
-        y_lr = tf.random.uniform([1, FLAGS.tflite_height, FLAGS.tflite_width, 1], 
+        y_lr = tf.random.uniform([1, FLAGS.tflite_height, FLAGS.tflite_width, 1],
                                 minval=0., maxval=1.)
         model_tflite = sesr.SESR(
           m=FLAGS.m,
@@ -141,7 +152,7 @@ def main(unused_argv):
           quant_A=FLAGS.quant_A > 0,
           gen_tflite = FLAGS.gen_tflite,
           mode='infer')
-        optimizer = tf.keras.optimizers.Adam(learning_rate=FLAGS.learning_rate, 
+        optimizer = tf.keras.optimizers.Adam(learning_rate=FLAGS.learning_rate,
                                       amsgrad=True)
         model_tflite.load_weights(final_save_path + '/model_weights')
         model_tflite.compile(optimizer=optimizer, loss='mae', metrics=[psnr])
