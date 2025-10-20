@@ -134,7 +134,7 @@ def main(unused_argv):
       # convert to ONNX
       spec = [tf.TensorSpec((1, None, None, 1), tf.float32, name="input_1")]
       output_path = final_save_path + '/model.onnx'
-      tf2onnx.convert.from_keras(model, input_signature=spec, opset=13,
+      tf2onnx.convert.from_keras(model, input_signature=spec, opset=16,
                                       output_path=output_path, inputs_as_nchw=["input_1"],
                                       outputs_as_nchw=["output_1"])
 

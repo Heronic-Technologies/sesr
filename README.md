@@ -2,13 +2,13 @@
 
 Code to accompany the paper: Collapsible Linear Blocks for Super-Efficient Super Resolution (MLSys 2022) [https://arxiv.org/abs/2103.09404]
 
-With similar or better image quality, SESR achieves 2x to 330x improvement (x2 and x4 super resolution) in Multiply-Accumulate (MAC) operations compared to existing methods. 
+With similar or better image quality, SESR achieves 2x to 330x improvement (x2 and x4 super resolution) in Multiply-Accumulate (MAC) operations compared to existing methods.
 
 ![SESR Achieves State-of-the-art Super Resolution Results](/SESR_results.png)
 
 
 ## Latest Updates
-**[New]** SESR accepted at the 5th Conference on Machine Learning and Systems (MLSys 2022). Latest version released on arXiv (link above) containing new results on open source NPU performance estimation, performance numbers on Arm CPU and GPU for a real mobile device, and more results. 
+**[New]** SESR accepted at the 5th Conference on Machine Learning and Systems (MLSys 2022). Latest version released on arXiv (link above) containing new results on open source NPU performance estimation, performance numbers on Arm CPU and GPU for a real mobile device, and more results.
 
 **Older updates:**
 
@@ -18,7 +18,7 @@ With similar or better image quality, SESR achieves 2x to 330x improvement (x2 a
 
 
 ## Prerequisites
-It is recommended to use a conda environment with python 3.6. Start by installing the requirements:
+It is recommended to use a conda environment with python 3.10. Start by installing the requirements:
 Minimum requirements: tensorflow-gpu>=2.3 and tensorflow_datasets>=4.1. Install these using the following command:
 
 `./install_requirements.sh`
@@ -29,7 +29,7 @@ PLEASE USE TENSORFLOW-GPU VERSION>=2.3 FOR QAT AND TFLITE SUPPORT.
 ## New Efficient Training Methodology
 The training time would increase if we directly train collapsible linear blocks in the expanded space and collapse them later. To address this, we developed an efficient implementation of SESR: We collapse the "Linear Blocks" at each training step (using Algorithms 1 and 2 shown in the paper), and then use this collapsed weight to perform forward pass convolutions. Since model weights are very small tensors compared to feature maps, this collapsing takes a very small time. _The training (backward pass) still updates the weights in the expanded space but the forward pass happens in collapsed space even during training_ (see figure below). Therefore, training the collapsible linear blocks is very efficient.
 
-For the SESR-M5 network and a batch of 32 [64x64] images, training in expanded space takes 41.77B MACs for a single forward pass, whereas our efficient implementation takes only 1.84B MACs. Similar improvements happen in GPU memory and backward pass (due to reduced size of layerwise Jacobians). 
+For the SESR-M5 network and a batch of 32 [64x64] images, training in expanded space takes 41.77B MACs for a single forward pass, whereas our efficient implementation takes only 1.84B MACs. Similar improvements happen in GPU memory and backward pass (due to reduced size of layerwise Jacobians).
 
 ![Expanded Training vs. Collapsed Training](/collapsed_training.png)
 
@@ -111,7 +111,7 @@ By default, the generated TFLITE inputs 1080p (1920x1080) image and outputs an u
 If you find this work useful, please consider citing our paper:
 
 ```
-@article{bhardwaj2021collapsible, 
+@article{bhardwaj2021collapsible,
   title={Collapsible Linear Blocks for Super-Efficient Super Resolution},
   author={Bhardwaj, Kartikeya and Milosavljevic, Milos and O'Neil, Liam and Gope, Dibakar and Matas, Ramon and Chalfin, Alex and Suda, Naveen and Meng, Lingchuan and Loh, Danny},
   journal={arXiv preprint arXiv:2103.09404},
