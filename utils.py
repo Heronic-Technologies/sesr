@@ -1,11 +1,11 @@
 # Copyright 2021 Arm Inc. All Rights Reserved.
-# 
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
-# 
+#
 # http://www.apache.org/licenses/LICENSE-2.0
-# 
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -14,11 +14,16 @@
 # ==============================================================================
 
 
-from typing import Callable, List, Tuple, Optional
+import os
+import sys
+from typing import Callable, List, Optional, Tuple
+
+import numpy as np
 import tensorflow as tf
 import tensorflow_datasets as tfds
-import numpy as np
-import os
+from colorama import Fore, init
+
+init(autoreset=True)
 
 FLAGS = tf.compat.v1.flags.FLAGS
 tf.compat.v1.flags.DEFINE_integer('scale', 2, 'Scale of SISR')
@@ -58,14 +63,14 @@ def rgb_to_y(example: tfds.features.FeaturesDict) -> Tuple[tf.Tensor, tf.Tensor]
 def random_patch(lr: tf.Tensor, hr: tf.Tensor) -> Tuple[tf.Tensor, tf.Tensor]:
     def lr_offset(axis: int):
         size = tf.shape(lr)[axis]
-        return tf.random.uniform(shape=(), maxval=size - PATCH_SIZE_LR, 
+        return tf.random.uniform(shape=(), maxval=size - PATCH_SIZE_LR,
                                  dtype=tf.dtypes.int32)
 
     lr_offset_x, lr_offset_y = lr_offset(axis=0), lr_offset(axis=1)
     hr_offset_x, hr_offset_y = SCALE * lr_offset_x, SCALE * lr_offset_y
-    lr = lr[lr_offset_x:lr_offset_x + PATCH_SIZE_LR, 
+    lr = lr[lr_offset_x:lr_offset_x + PATCH_SIZE_LR,
             lr_offset_y:lr_offset_y + PATCH_SIZE_LR]
-    hr = hr[hr_offset_x:hr_offset_x + PATCH_SIZE_HR, 
+    hr = hr[hr_offset_x:hr_offset_x + PATCH_SIZE_HR,
             hr_offset_y:hr_offset_y + PATCH_SIZE_HR]
     return lr, hr
 
@@ -109,12 +114,69 @@ def generate_int8_tflite(model: tf.keras.Model,
       tf.lite.OpsSet.SELECT_TF_OPS # enable TensorFlow ops.
     ]
     tflite_model = converter.convert()
-    
+
     if not os.path.exists(path):
         os.makedirs(path)
-    tflite_filename = path + '/' + filename + '.tflite'    
+    tflite_filename = path + '/' + filename + '.tflite'
     with open(tflite_filename, 'wb') as f:
         f.write(tflite_model)
-    
+
     return tflite_filename
 
+def load_custom_dataset(data_dir: str, split: str = 'train') -> tf.data.Dataset:
+    """Load a custom SR dataset from folder structure.
+
+    Args:
+        data_dir: Path to dataset root (containing train/validation folders)
+        split: 'train' or 'validation'
+
+    Returns:
+        tf.data.Dataset yielding {'lr': tensor, 'hr': tensor}
+    """
+    print(f"{Fore.CYAN}Loading dataset from {data_dir}, split: {split}")
+
+    lr_dir = os.path.join(data_dir, split, 'lr')
+    hr_dir = os.path.join(data_dir, split, 'hr')
+
+    # Get sorted file lists
+    lr_files = sorted(tf.io.gfile.glob(os.path.join(lr_dir, '*')))
+    hr_files = sorted(tf.io.gfile.glob(os.path.join(hr_dir, '*')))
+
+    def load_image_pair(lr_path, hr_path):
+        lr = tf.io.read_file(lr_path)
+        lr = tf.image.decode_image(lr, channels=3, expand_animations=False)
+        hr = tf.io.read_file(hr_path)
+        hr = tf.image.decode_image(hr, channels=3, expand_animations=False)
+        return {'lr': lr, 'hr': hr}
+
+    dataset = tf.data.Dataset.from_tensor_slices((lr_files, hr_files))
+    dataset = dataset.map(load_image_pair, num_parallel_calls=tf.data.AUTOTUNE)
+    return dataset
+
+def load_hr_only_dataset(data_dir: str, split: str = 'train', scale: int = 2) -> tf.data.Dataset:
+    """Load dataset from HR images only, generating LR via bicubic downsampling."""
+    print(f"{Fore.CYAN}Loading HR-only dataset from {data_dir}, split: {split}, scale: {scale}")
+
+    hr_dir = os.path.join(data_dir, split, 'hr')
+    hr_files = sorted(tf.io.gfile.glob(os.path.join(hr_dir, '*')))
+
+    def load_and_downsample(hr_path):
+        hr = tf.io.read_file(hr_path)
+        hr = tf.image.decode_image(hr, channels=3, expand_animations=False)
+        hr = tf.cast(hr, tf.float32)
+
+        # Get dimensions and ensure divisibility by scale
+        shape = tf.shape(hr)
+        h = (shape[0] // scale) * scale
+        w = (shape[1] // scale) * scale
+        hr = hr[:h, :w, :]
+
+        # Downsample to create LR
+        lr = tf.image.resize(hr, [h // scale, w // scale], method='bicubic')
+        lr = tf.clip_by_value(lr, 0, 255)
+
+        return {'lr': tf.cast(lr, tf.uint8), 'hr': tf.cast(hr, tf.uint8)}
+
+    dataset = tf.data.Dataset.from_tensor_slices(hr_files)
+    dataset = dataset.map(load_and_downsample, num_parallel_calls=tf.data.AUTOTUNE)
+    return dataset

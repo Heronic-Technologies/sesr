@@ -14,15 +14,19 @@
 # ==============================================================================
 
 
-from typing import Callable, List, Tuple
+import atexit
 import os
+from typing import Callable, List, Tuple
+
 import onnx
-import tf2onnx
 import tensorflow as tf
 import tensorflow_datasets as tfds
-import atexit
+import tf2onnx
+from colorama import Fore, init
 
-from models import sesr, model_utils
+from models import model_utils, sesr
+
+init(autoreset=True)
 
 FLAGS = tf.compat.v1.flags.FLAGS
 tf.compat.v1.flags.DEFINE_integer('epochs', 300, 'Number of epochs to train')
@@ -39,6 +43,9 @@ import utils
 
 #Set some dataset processing parameters and some save/load paths
 DATASET_NAME = 'div2k' if FLAGS.scale == 2 else 'div2k/bicubic_x4'
+CUSTOM_DATASET = False  #Set to True to use custom dataset instead of DIV2K
+if CUSTOM_DATASET:
+  print(f'{Fore.MAGENTA}Using custom dataset for training and evaluation.')
 if not os.path.exists('logs/'):
   os.makedirs('logs/')
 BASE_SAVE_DIR = 'logs/x2_models/' if FLAGS.scale == 2 else 'logs/x4_models/'
@@ -49,12 +56,13 @@ SUFFIX = 'QAT' if (FLAGS.quant_W and FLAGS.quant_A) else 'FP32'
 
 if FLAGS.scale == 4: #Specify path to load x2 models (x4 SISR will only finetune x2 models)
   if FLAGS.model_name == 'SESR':
-    PATH_2X = 'logs/x2_models/'+FLAGS.model_name+'_m{}_f{}_x2_fs{}_{}Training_{}'.format(
+    PATH_2X = 'logs/x2_models/'+FLAGS.model_name+'_m{}_f{}_x2_fs{}_{}Training_{}{}'.format(
                                                                   FLAGS.m,
                                                                   FLAGS.int_features,
                                                                   FLAGS.feature_size,
                                                                   FLAGS.linear_block_type,
-                                                                  SUFFIX)
+                                                                  SUFFIX,
+                                                                  '_custom' if CUSTOM_DATASET else '')
 
 
 ##################################
@@ -66,14 +74,31 @@ def main(unused_argv):
 
     data_dir = os.getenv("TFDS_DATA_DIR", None)
 
-    dataset_train, dataset_validation = tfds.load(DATASET_NAME,
-                                   split=['train', 'validation'], shuffle_files=True,
-                                   data_dir=data_dir)
+    if not CUSTOM_DATASET:
+        dataset_train, dataset_validation = tfds.load(DATASET_NAME,
+                                    split=['train', 'validation'], shuffle_files=True,
+                                    data_dir=data_dir)
+    else:
+        # Option 1: Custom LR/HR pairs
+        dataset_train = utils.load_custom_dataset('datasets/lr_hr_example_dataset', 'train')
+        dataset_validation = utils.load_custom_dataset('datasets/lr_hr_example_dataset', 'validation')
+
+        # Option 2: Custom HR only (auto-generate LR)
+        # dataset_train = utils.load_hr_only_dataset('datasets/hr_only_example_dataset', 'train', scale=FLAGS.scale)
+        # dataset_validation = utils.load_hr_only_dataset('datasets/hr_only_example_dataset', 'validation', scale=FLAGS.scale)
+
     dataset_train = dataset_train.prefetch(buffer_size=tf.data.experimental.AUTOTUNE)
     dataset_validation = dataset_validation.prefetch(tf.data.experimental.AUTOTUNE)
     dataset_train = dataset_train.map(utils.rgb_to_y).cache()
     dataset_validation = dataset_validation.map(utils.rgb_to_y).cache()
     dataset_train = dataset_train.map(utils.patches).unbatch().shuffle(buffer_size=1_000)
+
+    # Set sharding policy to DATA to avoid auto-sharding warnings with custom datasets
+    if CUSTOM_DATASET:
+        options = tf.data.Options()
+        options.experimental_distribute.auto_shard_policy = tf.data.experimental.AutoShardPolicy.DATA
+        dataset_train = dataset_train.with_options(options)
+        dataset_validation = dataset_validation.with_options(options)
 
     #PSNR metric to be monitored while training.
     def psnr(y_true: tf.Tensor, y_pred: tf.Tensor) -> tf.Tensor:
@@ -125,9 +150,9 @@ def main(unused_argv):
 
     #Save the trained models.
     if FLAGS.model_name == 'SESR':
-      final_save_path = BASE_SAVE_DIR+FLAGS.model_name+'_m{}_f{}_x{}_fs{}_{}Training_{}'.format(
+      final_save_path = BASE_SAVE_DIR+FLAGS.model_name+'_m{}_f{}_x{}_fs{}_{}Training_{}{}'.format(
                            FLAGS.m, FLAGS.int_features, FLAGS.scale, FLAGS.feature_size,
-                           FLAGS.linear_block_type, SUFFIX)
+                           FLAGS.linear_block_type, SUFFIX, '_custom' if CUSTOM_DATASET else '')
       model.save(final_save_path)
       model.save_weights(final_save_path + '/model_weights')
 
