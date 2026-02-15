@@ -15,12 +15,14 @@
 
 
 import os
-import sys
-from typing import Callable, List, Optional, Tuple
+from pathlib import Path
+from typing import List, Optional, Tuple
 
+import lpips
 import numpy as np
 import tensorflow as tf
 import tensorflow_datasets as tfds
+import torch
 from colorama import Fore, init
 
 init(autoreset=True)
@@ -32,7 +34,9 @@ tf.compat.v1.flags.DEFINE_integer('scale', 2, 'Scale of SISR')
 SCALE = FLAGS.scale
 if SCALE != 2 and SCALE != 4:
   raise ValueError('Only x2 or x4 SISR is currently supported')
-PATCH_SIZE_HR = 128 if SCALE == 2 else 200
+# PATCH_SIZE_HR = 128 if SCALE == 2 else 200
+PATCH_SIZE_HR = 128 if SCALE == 2 else 256
+# PATCH_SIZE_HR = 128 if SCALE == 2 else 384
 PATCH_SIZE_LR = PATCH_SIZE_HR // SCALE
 PATCHES_PER_IMAGE = 64
 
@@ -51,6 +55,16 @@ def rgb_to_ycbcr(rgb: tf.Tensor) -> tf.Tensor:
     ycbcr = tf.linalg.matmul(rgb, ycbcr_from_rgb, transpose_b=True)
     return ycbcr + tf.constant([[[16., 128., 128.]]])
 
+#Convert YCbCr image to RGB
+def ycbcr_to_rgb(ycbcr: tf.Tensor) -> tf.Tensor:
+    rgb_from_ycbcr = tf.constant([[0.00456621, 0.00456621, 0.00456621],
+                                  [0, -0.00153632, 0.00791071],
+                                  [0.00625893, -0.00318811, 0]])
+
+    ycbcr = ycbcr - tf.constant([[[16., 128., 128.]]])
+    rgb = tf.linalg.matmul(ycbcr, rgb_from_ycbcr, transpose_b=True)
+    rgb = tf.clip_by_value(rgb, 0., 1.)
+    return rgb
 
 #Get the Y-Channel only
 def rgb_to_y(example: tfds.features.FeaturesDict) -> Tuple[tf.Tensor, tf.Tensor]:
@@ -58,6 +72,11 @@ def rgb_to_y(example: tfds.features.FeaturesDict) -> Tuple[tf.Tensor, tf.Tensor]
     hr_ycbcr = rgb_to_ycbcr(example['hr'])
     return lr_ycbcr[..., 0:1] / 255., hr_ycbcr[..., 0:1] / 255.
 
+
+#Convert Y-Channel to RGB (replicate Y across 3 channels)
+def y_to_rgb(y: tf.Tensor) -> tf.Tensor:
+    rgb = tf.concat([y, y, y], axis=-1)
+    return rgb
 
 #Extract random patches for training
 def random_patch(lr: tf.Tensor, hr: tf.Tensor) -> Tuple[tf.Tensor, tf.Tensor]:
@@ -93,6 +112,29 @@ def patches(lr: tf.Tensor, hr: tf.Tensor) -> Tuple[List[tf.Tensor], List[tf.Tens
     lr, hr = zip(*tuples)
     return list(lr), list(hr)
 
+def scale_match(lr, hr):
+    lr_shape = tf.shape(lr)  # [H, W, C]
+    hr_shape = tf.shape(hr)
+
+    # Basic sanity: rank 3
+    ok_rank = tf.logical_and(tf.equal(tf.rank(lr), 3), tf.equal(tf.rank(hr), 3))
+
+    # Positive dims (avoid rot90 assertion / empty tensors)
+    ok_pos = tf.reduce_all(lr_shape[:3] > 0) & tf.reduce_all(hr_shape[:3] > 0)
+
+    # Channels match
+    ok_c = tf.equal(lr_shape[2], hr_shape[2])
+
+    # Scale match
+    ok_scale = tf.logical_and(
+        tf.equal(hr_shape[0], lr_shape[0] * FLAGS.scale),
+        tf.equal(hr_shape[1], lr_shape[1] * FLAGS.scale),
+    )
+
+    # Optional: skip “tiny” images
+    ok_min = tf.logical_and(lr_shape[0] > 2, lr_shape[1] > 2) & tf.logical_and(hr_shape[0] > 2, hr_shape[1] > 2)
+
+    return ok_rank & ok_pos & ok_c & ok_scale & ok_min
 
 #Generate INT8 TFLITE
 def generate_int8_tflite(model: tf.keras.Model,
@@ -123,24 +165,32 @@ def generate_int8_tflite(model: tf.keras.Model,
 
     return tflite_filename
 
-def load_custom_dataset(data_dir: str, split: str = 'train') -> tf.data.Dataset:
-    """Load a custom SR dataset from folder structure.
+def load_custom_dataset(data_dir: str, split: str = 'train', hr_folder_suffix: str = '', lr_folder_suffix: str = '', hr_file_suffix: str = '', lr_file_suffix: str = '') -> tf.data.Dataset:
+    """Load a custom SR dataset from folder structure."""
+    print(f"{Fore.CYAN}Loading dataset from {data_dir}, split: {split}, hr_suffix: {hr_folder_suffix}, lr_suffix: {lr_folder_suffix}")
 
-    Args:
-        data_dir: Path to dataset root (containing train/validation folders)
-        split: 'train' or 'validation'
+    lr_dir = os.path.join(data_dir, split, 'lr', lr_folder_suffix)
+    hr_dir = os.path.join(data_dir, split, 'hr', hr_folder_suffix)
 
-    Returns:
-        tf.data.Dataset yielding {'lr': tensor, 'hr': tensor}
-    """
-    print(f"{Fore.CYAN}Loading dataset from {data_dir}, split: {split}")
+    hr_files = []
+    lr_files = []
 
-    lr_dir = os.path.join(data_dir, split, 'lr')
-    hr_dir = os.path.join(data_dir, split, 'hr')
+    for hr_file in sorted(tf.io.gfile.glob(os.path.join(hr_dir, '*'))):
+        hr_filename = os.path.basename(hr_file)
+        if hr_file_suffix != '':
+            lr_filename = hr_filename.replace(hr_file_suffix, lr_file_suffix)
+        else:
+            lr_filename = Path(hr_file).stem + lr_file_suffix + Path(hr_file).suffix
+        lr_path = os.path.join(lr_dir, lr_filename)
+        if tf.io.gfile.exists(lr_path):
+            lr_files.append(lr_path)
+            hr_files.append(hr_file)
+        else:
+            print(f"{Fore.RED}WARNING: LR file not found for HR file {hr_file}: expected {lr_path}. This pair will be skipped.")
 
-    # Get sorted file lists
-    lr_files = sorted(tf.io.gfile.glob(os.path.join(lr_dir, '*')))
-    hr_files = sorted(tf.io.gfile.glob(os.path.join(hr_dir, '*')))
+    if len(lr_files) != len(hr_files):
+        print(f"{Fore.RED}WARNING: Mismatch in number of LR and HR images!")
+        exit()
 
     def load_image_pair(lr_path, hr_path):
         lr = tf.io.read_file(lr_path)
@@ -153,11 +203,11 @@ def load_custom_dataset(data_dir: str, split: str = 'train') -> tf.data.Dataset:
     dataset = dataset.map(load_image_pair, num_parallel_calls=tf.data.AUTOTUNE)
     return dataset
 
-def load_hr_only_dataset(data_dir: str, split: str = 'train', scale: int = 2) -> tf.data.Dataset:
+def load_hr_only_dataset(data_dir: str, split: str = 'train', scale: int = 2, hr_suffix: str = '') -> tf.data.Dataset:
     """Load dataset from HR images only, generating LR via bicubic downsampling."""
-    print(f"{Fore.CYAN}Loading HR-only dataset from {data_dir}, split: {split}, scale: {scale}")
+    print(f"{Fore.CYAN}Loading HR-only dataset from {data_dir}, split: {split}, scale: {scale}, hr_suffix: {hr_suffix}")
 
-    hr_dir = os.path.join(data_dir, split, 'hr')
+    hr_dir = os.path.join(data_dir, split, 'hr', hr_suffix)
     hr_files = sorted(tf.io.gfile.glob(os.path.join(hr_dir, '*')))
 
     def load_and_downsample(hr_path):
@@ -180,3 +230,90 @@ def load_hr_only_dataset(data_dir: str, split: str = 'train', scale: int = 2) ->
     dataset = tf.data.Dataset.from_tensor_slices(hr_files)
     dataset = dataset.map(load_and_downsample, num_parallel_calls=tf.data.AUTOTUNE)
     return dataset
+
+class LPIPSLoss:
+    """
+    PyTorch LPIPS wrapper for TensorFlow/Y-channel training.
+    """
+
+    def __init__(self, net='alex', use_gpu=True):
+        """
+        Args:
+            net: 'alex', 'vgg', or 'squeeze'
+            use_gpu: Use GPU if available
+        """
+        self.net = net
+        self.device = 'cuda' if use_gpu and torch.cuda.is_available() else 'cpu'
+
+        print(f"Initializing LPIPS ({net}) on {self.device}")
+
+        # Initialize LPIPS model
+        self.loss_fn = lpips.LPIPS(net=net).to(self.device)
+        self.loss_fn.eval()  # Set to evaluation mode
+
+    def _compute_lpips_numpy(self, y_true_np, y_pred_np):
+        """
+        Compute LPIPS between Y channel images.
+
+        Args:
+            y_true: [B, H, W, 1] Y channel ground truth in [0, 1]
+            y_pred: [B, H, W, 1] Y channel prediction in [0, 1]
+
+        Returns:
+            LPIPS distance (scalar, typically 0.0-1.0)
+        """
+        # Convert Y [B, H, W, 1] to grayscale RGB [B, H, W, 3]
+        if y_true_np.shape[-1] == 1:
+            y_true_rgb = np.concatenate([y_true_np, y_true_np, y_true_np], axis=-1)
+        elif y_true_np.shape[-1] == 3:
+            y_true_rgb = y_true_np
+        else:
+            raise ValueError(f"Expected y_true to have 1 or 3 channels, got {y_true_np.shape[-1]}")
+        if y_pred_np.shape[-1] == 1:
+            y_pred_rgb = np.concatenate([y_pred_np, y_pred_np, y_pred_np], axis=-1)
+        elif y_pred_np.shape[-1] == 3:
+            y_pred_rgb = y_pred_np
+        else:
+            raise ValueError(f"Expected y_pred to have 1 or 3 channels, got {y_pred_np.shape[-1]}")
+
+        # Convert to PyTorch format: [B, H, W, C] -> [B, C, H, W]
+        y_true_rgb = np.transpose(y_true_rgb, (0, 3, 1, 2))
+        y_pred_rgb = np.transpose(y_pred_rgb, (0, 3, 1, 2))
+
+        # Convert to PyTorch tensors in [-1, 1] range
+        y_true_torch = torch.from_numpy(y_true_rgb).float().to(self.device)
+        y_pred_torch = torch.from_numpy(y_pred_rgb).float().to(self.device)
+
+        # Scale from [0, 1] to [-1, 1]
+        y_true_torch = y_true_torch * 2.0 - 1.0
+        y_pred_torch = y_pred_torch * 2.0 - 1.0
+
+        # Compute LPIPS
+        with torch.no_grad():
+            distance = self.loss_fn(y_true_torch, y_pred_torch)
+
+        # Return mean distance as numpy float
+        return np.float32(distance.mean().cpu().numpy())
+
+    def __call__(self, y_true, y_pred):
+        """
+        Compute LPIPS - works in both eager and graph mode.
+
+        Args:
+            y_true: TF tensor [B, H, W, 1] in [0, 1]
+            y_pred: TF tensor [B, H, W, 1] in [0, 1]
+
+        Returns:
+            TF scalar: LPIPS distance
+        """
+        # Use tf.py_function to call PyTorch code
+        lpips_value = tf.py_function(
+            func=self._compute_lpips_numpy,
+            inp=[y_true, y_pred],
+            Tout=tf.float32
+        )
+
+        # Ensure it's a scalar
+        lpips_value = tf.reshape(lpips_value, [])
+
+        return tf.stop_gradient(lpips_value)

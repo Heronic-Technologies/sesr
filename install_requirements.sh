@@ -8,4 +8,5 @@ pip install tf2onnx
 #Conda is used here since it takes care of correct cudatoolkit and cudnn
 pip install tensorflow[and-cuda]==2.14.0
 pip install numpy==1.26.4
+pip install lpips
 
