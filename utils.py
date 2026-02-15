@@ -233,7 +233,122 @@ def load_hr_only_dataset(data_dir: str, split: str = 'train', scale: int = 2, hr
 
 class LPIPSLoss:
     """
-    PyTorch LPIPS wrapper for TensorFlow/Y-channel training.
+    Differentiable LPIPS-like perceptual loss in TensorFlow.
+
+    Inputs:
+        y_true, y_pred: TF tensors [B,H,W,1] or [B,H,W,3] in [0, 1]
+
+    Nets:
+        - net='vgg'  -> VGG16 (ImageNet) feature loss (classic perceptual loss)
+        - net='mobilenetv2' -> MobileNetV2 (ImageNet) feature loss (acts as an "Alex-like" lightweight backbone)
+    """
+
+    def __init__(self, net='mobilenetv2', use_gpu=True,
+                 layer_weights=None,
+                 eps=1e-10):
+        self.net = net.lower()
+        self.eps = tf.constant(eps, tf.float32)
+
+        if self.net == 'vgg':
+            layer_names = [
+                "block2_conv2","block3_conv3","block4_conv3",
+            ]
+            if layer_weights is None:
+                layer_weights = [1.0, 1.0, 1.0]
+            self._build_vgg16(layer_names)
+
+        elif self.net == 'mobilenetv2':
+            layer_names = [
+                "block_3_expand_relu","block_6_expand_relu","out_relu",
+            ]
+            if layer_weights is None:
+                layer_weights = [1.0, 1.0, 1.0]
+            self._build_mobilenetv2(layer_names)
+
+        else:
+            raise ValueError("net must be 'mobilenetv2' or 'vgg'")
+
+        self.layer_weights = tf.constant(layer_weights, dtype=tf.float32)
+
+    # ---------- Backbone builders ----------
+    def _build_vgg16(self, layer_names):
+        base = tf.keras.applications.VGG16(include_top=False, weights="imagenet")
+        base.trainable = False
+        outs = [base.get_layer(n).output for n in layer_names]
+        self.feature_model = tf.keras.Model(base.input, outs, name="vgg16_features")
+        self.feature_model.trainable = False
+        self._preprocess = self._preprocess_vgg
+
+    def _build_mobilenetv2(self, layer_names):
+        base = tf.keras.applications.MobileNetV2(include_top=False, weights="imagenet")
+        base.trainable = False
+        outs = [base.get_layer(n).output for n in layer_names]
+        self.feature_model = tf.keras.Model(base.input, outs, name="mobilenetv2_features")
+        self.feature_model.trainable = False
+        self._preprocess = self._preprocess_mobilenetv2
+
+    # ---------- Input helpers ----------
+    def _preprocess_vgg(self, x_01_rgb):
+        """
+        VGG16 preprocess:
+          expects RGB in 0..255 and does the standard vgg16.preprocess_input transform.
+        """
+        x = tf.clip_by_value(x_01_rgb, 0.0, 1.0) * 255.0
+        return tf.keras.applications.vgg16.preprocess_input(x)
+
+    def _preprocess_mobilenetv2(self, x_01_rgb):
+        """
+        MobileNetV2 preprocess:
+          expects RGB in 0..255 then maps to [-1,1] internally.
+        This is close to LPIPS-style input scaling.
+        """
+        x = tf.clip_by_value(x_01_rgb, 0.0, 1.0) * 255.0
+        return tf.keras.applications.mobilenet_v2.preprocess_input(x)
+
+    @staticmethod
+    def _channelwise_unit_normalize(f, eps):
+        """
+        LPIPS-style-ish feature normalization:
+        normalize each spatial position by channel norm.
+        f: [B,H,W,C]
+        """
+        denom = tf.sqrt(tf.reduce_sum(tf.square(f), axis=-1, keepdims=True) + eps)
+        return f / denom
+
+    # ---------- Main call ----------
+    def __call__(self, y_true, y_pred):
+        """
+        Returns:
+            TF scalar perceptual distance (differentiable w.r.t y_pred)
+        """
+        # 1) Y -> RGB
+        y_true_rgb = y_to_rgb(y_true)
+        y_pred_rgb = y_to_rgb(y_pred)
+
+        # 2) Backbone-specific preprocessing
+        y_true_in = self._preprocess(y_true_rgb)
+        y_pred_in = self._preprocess(y_pred_rgb)
+
+        # 3) Extract features
+        ft_list = self.feature_model(y_true_in, training=False)
+        fp_list = self.feature_model(y_pred_in, training=False)
+        if not isinstance(ft_list, (list, tuple)):
+            ft_list, fp_list = [ft_list], [fp_list]
+
+        # 4) LPIPS-like distance: sum over layers of feature differences
+        #    Using L2 on channel-normalized features (stable for SR).
+        losses = []
+        for w, ft, fp in zip(tf.unstack(self.layer_weights), ft_list, fp_list):
+            ft_n = self._channelwise_unit_normalize(ft, self.eps)
+            fp_n = self._channelwise_unit_normalize(fp, self.eps)
+            # mean over batch + spatial + channels
+            losses.append(w * tf.reduce_mean(tf.square(ft_n - fp_n)))
+
+        return tf.add_n(losses)
+
+class LPIPSMetric:
+    """
+    PyTorch LPIPS wrapper for TensorFlow/Y-channel.
     """
 
     def __init__(self, net='alex', use_gpu=True):

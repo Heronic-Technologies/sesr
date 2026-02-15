@@ -56,7 +56,8 @@ if not os.path.exists(BASE_SAVE_DIR):
 
 SUFFIX = 'QAT' if (FLAGS.quant_W and FLAGS.quant_A) else 'FP32'
 
-lpips_loss = utils.LPIPSLoss(net='alex')
+lpips_metric = utils.LPIPSMetric(net='alex')
+lpips_loss = utils.LPIPSLoss(net='mobilenetv2')
 
 if FLAGS.scale == 4: #Specify path to load x2 models (x4 SISR will only finetune x2 models)
   if FLAGS.model_name == 'SESR':
@@ -115,20 +116,19 @@ def main(unused_argv):
     def lpips(y_true: tf.Tensor, y_pred: tf.Tensor) -> tf.Tensor:
         y_true_rgb = utils.y_to_rgb(y_true)
         y_pred_rgb = utils.y_to_rgb(y_pred)
-        return lpips_loss(y_true_rgb, y_pred_rgb)
+        return lpips_metric(y_true_rgb, y_pred_rgb)
+
+    def l1_loss(y_true: tf.Tensor, y_pred: tf.Tensor) -> tf.Tensor:
+        return tf.reduce_mean(tf.abs(y_true - y_pred))
+
+    def perceptual_loss(y_true: tf.Tensor, y_pred: tf.Tensor) -> tf.Tensor:
+        return lpips_loss(y_true, y_pred)
 
     # Combined loss: L1 + LPIPS
-    def combined_loss(y_true, y_pred):
-        """
-        Recommended: L1 + LPIPS combination
-        """
-        l1_loss = tf.reduce_mean(tf.abs(y_true - y_pred))
-        lpips_loss = lpips(y_true, y_pred)
-
-        # Standard weights from literature
-        total_loss = 1.0 * l1_loss + 0.03 * lpips_loss
-
-        return total_loss
+    def combined_loss(y_true: tf.Tensor, y_pred: tf.Tensor) -> tf.Tensor:
+        l1 = l1_loss(y_true, y_pred)
+        p = perceptual_loss(y_true, y_pred)
+        return l1 + 1.5 * p # lambda factor of 1.5 works well with LPIPS in mobilenetv2 on the DF2K dataset. For other backbones/datasets, this may need to be tuned for best results.
 
     if FLAGS.eval_only:
         print(f"{Fore.CYAN}Running validation only...")
@@ -202,22 +202,12 @@ def main(unused_argv):
     #Compile and train the model.
     if FLAGS.comb_loss:
         print(f"{Fore.CYAN}Using combined L1 + LPIPS loss for training.")
-        model.compile(optimizer=optimizer, loss=combined_loss, metrics=[psnr, lpips])
+        model.compile(optimizer=optimizer, loss=combined_loss, metrics=[l1_loss, perceptual_loss, psnr, lpips])
     else:
         print(f"{Fore.CYAN}Using L1 loss for training.")
-        model.compile(optimizer=optimizer, loss='mae', metrics=[psnr, lpips])
+        model.compile(optimizer=optimizer, loss='mae', metrics=[l1_loss, perceptual_loss, psnr, lpips])
 
     # End of mirrored_strategy.scope()
-
-    # for lr_y, hr_y in dataset_train:
-        # print(f"{Fore.CYAN}Sample LR patch shape: {lr_y.shape} ({lr_y.dtype}), Sample HR patch shape: {hr_y.shape} ({hr_y.dtype})")
-        # print(f"{Fore.CYAN}LR pixel value range: [{tf.reduce_min(lr_y).numpy():.4f}, {tf.reduce_max(lr_y).numpy():.4f}], HR pixel value range: [{tf.reduce_min(hr_y).numpy():.4f}, {tf.reduce_max(hr_y).numpy():.4f}]")
-        # model_out = model(lr_y[None, ...], training=False)
-        # print(f"{Fore.CYAN}Model output shape: {model_out.shape}, Model output dtype: {model_out.dtype}, Model output pixel value range: [{tf.reduce_min(model_out).numpy():.4f}, {tf.reduce_max(model_out).numpy():.4f}]")
-        # print(f"{Fore.CYAN}HR shape: {hr_y[None, ...].shape}, HR dtype: {hr_y[None, ...].dtype}, HR pixel value range: [{tf.reduce_min(hr_y[None, ...]).numpy():.4f}, {tf.reduce_max(hr_y[None, ...]).numpy():.4f}]")
-        # lpips_value = lpips(hr_y[None, ...], model_out)
-        # print(f"{Fore.CYAN}LPIPS value for sample patch: {lpips_value:.4f}")
-    # exit()
 
     model.fit(dataset_train.batch(FLAGS.batch_size),
               epochs=FLAGS.epochs,
