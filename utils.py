@@ -251,18 +251,26 @@ class LPIPSLoss:
 
         if self.net == 'vgg':
             layer_names = [
-                "block2_conv2","block3_conv3","block4_conv3",
+                "block1_conv2",
+                "block2_conv2",
+                "block3_conv3",
+                "block4_conv3",
+                "block5_conv3",
             ]
             if layer_weights is None:
-                layer_weights = [1.0, 1.0, 1.0]
+                layer_weights = [1.0, 1.0, 1.0, 1.0, 1.0]
             self._build_vgg16(layer_names)
 
         elif self.net == 'mobilenetv2':
             layer_names = [
-                "block_3_expand_relu","block_6_expand_relu","out_relu",
+                "block_1_expand_relu",
+                "block_3_expand_relu",
+                "block_6_expand_relu",
+                "block_13_expand_relu",
+                "out_relu",
             ]
             if layer_weights is None:
-                layer_weights = [1.0, 1.0, 1.0]
+                layer_weights = [1.0, 1.0, 1.0, 1.0, 1.0]
             self._build_mobilenetv2(layer_names)
 
         else:

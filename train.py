@@ -61,7 +61,7 @@ lpips_loss = utils.LPIPSLoss(net='mobilenetv2')
 
 if FLAGS.scale == 4: #Specify path to load x2 models (x4 SISR will only finetune x2 models)
   if FLAGS.model_name == 'SESR':
-    PATH_2X = 'logs/x2_models/'+FLAGS.model_name+'_m{}_f{}_x2_fs{}_{}_{}_{}Training_{}{}'.format(
+    PATH_2X = 'logs/x2_models/'+FLAGS.model_name+'_m{}_f{}_x2_fs{}{}{}_{}Training_{}{}'.format(
                                                                   FLAGS.m,
                                                                   FLAGS.int_features,
                                                                   FLAGS.feature_size,
@@ -85,8 +85,8 @@ def main(unused_argv):
                                     data_dir=data_dir)
     else:
         # Option 1: Custom LR/HR pairs
-        dataset_train = utils.load_custom_dataset('datasets/DF2K', 'train', lr_folder_suffix=f'{FLAGS.scale}x_{DEGRADATION_METHOD}', lr_file_suffix='x2')
-        dataset_validation = utils.load_custom_dataset('datasets/DF2K', 'val', lr_folder_suffix=f'{FLAGS.scale}x_{DEGRADATION_METHOD}', lr_file_suffix='x2')
+        dataset_train = utils.load_custom_dataset('datasets/DF2K', 'train', lr_folder_suffix=f'{FLAGS.scale}x_{DEGRADATION_METHOD}', lr_file_suffix=f'x{FLAGS.scale}')
+        dataset_validation = utils.load_custom_dataset('datasets/DF2K', 'val', lr_folder_suffix=f'{FLAGS.scale}x_{DEGRADATION_METHOD}', lr_file_suffix=f'x{FLAGS.scale}')
 
         # Option 2: Custom HR only (auto-generate LR)
         # dataset_train = utils.load_hr_only_dataset('datasets/hr_only_example_dataset', 'train', scale=FLAGS.scale)
