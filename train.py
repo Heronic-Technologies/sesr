@@ -40,6 +40,10 @@ tf.compat.v1.flags.DEFINE_bool('eval_only', False, 'Run validation only (no trai
 tf.compat.v1.flags.DEFINE_string('model_path', '', 'Path to trained model for evaluation')
 tf.compat.v1.flags.DEFINE_bool('comb_loss', False, 'Use combined L1 + LPIPS loss instead of just L1')
 
+# OPTIMIZATION FLAGS
+tf.compat.v1.flags.DEFINE_bool('use_mixed_precision', False, 'Use mixed precision training for faster computation')
+tf.compat.v1.flags.DEFINE_bool('skip_lpips_metric', True, 'Skip LPIPS metric during training (only compute on validation)')
+
 import utils
 
 #Set some dataset processing parameters and some save/load paths
@@ -55,9 +59,6 @@ if not os.path.exists(BASE_SAVE_DIR):
   os.makedirs(BASE_SAVE_DIR)
 
 SUFFIX = 'QAT' if (FLAGS.quant_W and FLAGS.quant_A) else 'FP32'
-
-lpips_metric = utils.LPIPSMetric(net='alex')
-lpips_loss = utils.LPIPSLoss(net='mobilenetv2')
 
 if FLAGS.scale == 4: #Specify path to load x2 models (x4 SISR will only finetune x2 models)
   if FLAGS.model_name == 'SESR':
@@ -76,6 +77,22 @@ if FLAGS.scale == 4: #Specify path to load x2 models (x4 SISR will only finetune
 ##################################
 
 def main(unused_argv):
+    # Initialize metrics and losses with optimizations
+    lpips_loss = utils.LPIPSLoss(
+        net='mobilenetv2',
+        use_mixed_precision=FLAGS.use_mixed_precision
+    )
+
+    lpips_metric = None
+    if not FLAGS.skip_lpips_metric:
+        print(f"{Fore.YELLOW}Warning: Computing LPIPS metric during training will slow down training significantly!")
+        print(f"{Fore.YELLOW}Consider setting --skip_lpips_metric=True to only compute it on validation.")
+        lpips_metric = utils.LPIPSMetric(net='alex')
+
+    # Enable mixed precision if requested
+    if FLAGS.use_mixed_precision:
+        policy = tf.keras.mixed_precision.Policy('mixed_float16')
+        tf.keras.mixed_precision.set_global_policy(policy)
 
     data_dir = os.getenv("TFDS_DATA_DIR", None)
 
@@ -93,12 +110,13 @@ def main(unused_argv):
         # dataset_validation = utils.load_hr_only_dataset('datasets/hr_only_example_dataset', 'val', scale=FLAGS.scale)
 
     dataset_train = dataset_train.prefetch(buffer_size=tf.data.experimental.AUTOTUNE)
-    dataset_train = dataset_train.map(utils.rgb_to_y).cache()
+    dataset_train = dataset_train.map(utils.rgb_to_y, num_parallel_calls=tf.data.AUTOTUNE).cache()
     dataset_train = dataset_train.filter(utils.scale_match)
-    dataset_train = dataset_train.map(utils.patches).unbatch().shuffle(buffer_size=1_000)
+    dataset_train = dataset_train.map(utils.patches, num_parallel_calls=tf.data.AUTOTUNE)
+    dataset_train = dataset_train.unbatch().shuffle(buffer_size=1_000)
 
-    dataset_validation = dataset_validation.prefetch(tf.data.experimental.AUTOTUNE)
-    dataset_validation = dataset_validation.map(utils.rgb_to_y).cache()
+    dataset_validation = dataset_validation.prefetch(buffer_size=tf.data.experimental.AUTOTUNE)
+    dataset_validation = dataset_validation.map(utils.rgb_to_y, num_parallel_calls=tf.data.AUTOTUNE).cache()
     dataset_validation = dataset_validation.filter(utils.scale_match)
 
     # Set sharding policy to DATA to avoid auto-sharding warnings with custom datasets
@@ -108,34 +126,53 @@ def main(unused_argv):
         dataset_train = dataset_train.with_options(options)
         dataset_validation = dataset_validation.with_options(options)
 
-    #PSNR metric to be monitored while training.
+    # Define metrics and losses.
+    @tf.function
     def psnr(y_true: tf.Tensor, y_pred: tf.Tensor) -> tf.Tensor:
         return tf.image.psnr(y_true, y_pred, max_val=1.)
 
-    #LPIPS metric to be monitored while training.
+    # LPIPS metric wrapper (only used if not skipped).
     def lpips(y_true: tf.Tensor, y_pred: tf.Tensor) -> tf.Tensor:
+        if FLAGS.skip_lpips_metric:
+            return tf.constant("N/A", dtype=tf.string)  # Return dummy value during training
         y_true_rgb = utils.y_to_rgb(y_true)
         y_pred_rgb = utils.y_to_rgb(y_pred)
         return lpips_metric(y_true_rgb, y_pred_rgb)
 
+    @tf.function
     def l1_loss(y_true: tf.Tensor, y_pred: tf.Tensor) -> tf.Tensor:
-        return tf.reduce_mean(tf.abs(y_true - y_pred))
+        loss =  tf.reduce_mean(tf.abs(y_true - y_pred))
+        return tf.cast(loss, tf.float32)
 
+    # Perceptual loss is always computed via TF
     def perceptual_loss(y_true: tf.Tensor, y_pred: tf.Tensor) -> tf.Tensor:
-        return lpips_loss(y_true, y_pred)
+        loss = lpips_loss(y_true, y_pred)
+        return tf.cast(loss, tf.float32)
 
     # Combined loss: L1 + LPIPS
+    @tf.function
     def combined_loss(y_true: tf.Tensor, y_pred: tf.Tensor) -> tf.Tensor:
         l1 = l1_loss(y_true, y_pred)
         p = perceptual_loss(y_true, y_pred)
-        return l1 + 1.2 * p # lambda factor of 1.2 works well with LPIPS in mobilenetv2 on the DF2K dataset. For other backbones/datasets, this may need to be tuned for best results.
+        l1 = tf.cast(l1, tf.float32)
+        p = tf.cast(p, tf.float32)
+        return l1 + 1.2 * p
 
     if FLAGS.eval_only:
         print(f"{Fore.CYAN}Running validation only...")
 
+        # For evaluation, always compute LPIPS metric
+        if lpips_metric is None:
+            lpips_metric = utils.LPIPSMetric(net='alex')
+
+        def lpips_eval(y_true: tf.Tensor, y_pred: tf.Tensor) -> tf.Tensor:
+            y_true_rgb = utils.y_to_rgb(y_true)
+            y_pred_rgb = utils.y_to_rgb(y_pred)
+            return lpips_metric(y_true_rgb, y_pred_rgb)
+
         model = tf.keras.models.load_model(
             FLAGS.model_path,
-            custom_objects={'psnr': psnr, 'lpips': lpips, 'combined_loss': combined_loss}
+            custom_objects={'psnr': psnr, 'lpips': lpips_eval, 'combined_loss': combined_loss}
         )
 
         results = model.evaluate(
@@ -168,12 +205,17 @@ def main(unused_argv):
         gen_tflite = FLAGS.gen_tflite,
         mode='train')
 
-    #Declare the optimizer.
-    optimizer = tf.keras.optimizers.Adam(learning_rate=FLAGS.learning_rate,
-                                      amsgrad=True)
+    # Declare the optimizer.
+    optimizer = tf.keras.optimizers.Adam(
+        learning_rate=FLAGS.learning_rate,
+        amsgrad=True
+    )
 
-    #If scale == 4, base x2 model must be loaded for transfer learning.
-    #Load the pretrained weights into the base model from x2 SISR:
+    # Use loss scaling for mixed precision.
+    if FLAGS.use_mixed_precision:
+        optimizer = tf.keras.mixed_precision.LossScaleOptimizer(optimizer)
+
+    # If scale == 4, base x2 model must be loaded for transfer learning
     if FLAGS.scale == 4:
       if CUSTOM_DATASET and os.path.exists(FLAGS.model_path):
         print(f"{Fore.CYAN}Loading model from {FLAGS.model_path} for finetuning on custom dataset...")
@@ -191,6 +233,7 @@ def main(unused_argv):
             if layer_name != 'linear_block_{}'.format(FLAGS.m+1): #Last layer in x4 is not the same as that in x2 for SESR
               print(layer_name)
               layer.set_weights = layer_dict[layer_name].get_weights()
+
     if FLAGS.scale == 2:
       if CUSTOM_DATASET and os.path.exists(FLAGS.model_path):
         print(f"{Fore.CYAN}Loading model from {FLAGS.model_path} for finetuning on custom dataset...")
@@ -199,23 +242,76 @@ def main(unused_argv):
             custom_objects={'psnr': psnr, 'lpips': lpips, 'combined_loss': combined_loss}
         )
 
-    #Compile and train the model.
+    # Compile the model.
     if FLAGS.comb_loss:
         print(f"{Fore.CYAN}Using combined L1 + LPIPS loss for training.")
-        model.compile(optimizer=optimizer, loss=combined_loss, metrics=[l1_loss, perceptual_loss, psnr, lpips])
+        if FLAGS.skip_lpips_metric:
+            compile_metrics = [l1_loss, perceptual_loss, psnr]
+        else:
+            compile_metrics = [l1_loss, perceptual_loss, psnr, lpips]
+
+        model.compile(
+            optimizer=optimizer,
+            loss=combined_loss,
+            metrics=compile_metrics,
+        )
     else:
         print(f"{Fore.CYAN}Using L1 loss for training.")
-        model.compile(optimizer=optimizer, loss='mae', metrics=[l1_loss, perceptual_loss, psnr, lpips])
+        if FLAGS.skip_lpips_metric:
+            compile_metrics = [l1_loss, perceptual_loss, psnr]
+        else:
+            compile_metrics = [l1_loss, perceptual_loss, psnr, lpips]
 
-    # End of mirrored_strategy.scope()
+        model.compile(
+            optimizer=optimizer,
+            loss='mae',
+            metrics=compile_metrics,
+        )
 
-    model.fit(dataset_train.batch(FLAGS.batch_size),
-              epochs=FLAGS.epochs,
-              validation_data=dataset_validation.batch(1),
-              validation_freq=1)
+    # Custom callback for LPIPS on validation only
+    class ValidationLPIPSCallback(tf.keras.callbacks.Callback):
+        def __init__(self, validation_data):
+            super().__init__()
+            self.validation_data = validation_data
+
+        def on_epoch_end(self, epoch, logs=None):
+            if FLAGS.skip_lpips_metric and lpips_metric is not None:
+                # Compute LPIPS on validation set
+                lpips_values = []
+                for lr, hr in self.validation_data:
+                    pred = self.model(lr, training=False)
+                    hr_rgb = utils.y_to_rgb(hr)
+                    pred_rgb = utils.y_to_rgb(pred)
+                    lpips_val = lpips_metric(hr_rgb, pred_rgb)
+                    lpips_values.append(float(lpips_val))
+
+                avg_lpips = sum(lpips_values) / len(lpips_values)
+                logs['val_lpips'] = avg_lpips
+                print(f"\n{Fore.CYAN}Validation LPIPS: {avg_lpips:.4f}")
+
+    callbacks = []
+    if FLAGS.skip_lpips_metric:
+        # Only add callback if we have the metric initialized
+        if lpips_metric is None:
+            lpips_metric = utils.LPIPSMetric(net='alex')
+        callbacks.append(ValidationLPIPSCallback(dataset_validation.batch(1)))
+
+    # Train the model
+    print(f"{Fore.GREEN}Starting training with optimizations:")
+    print(f"  - Mixed precision: {FLAGS.use_mixed_precision}")
+    print(f"  - Skip LPIPS during training: {FLAGS.skip_lpips_metric}")
+    print(f"  - Batch size: {FLAGS.batch_size}")
+
+    model.fit(
+        dataset_train.batch(FLAGS.batch_size),
+        epochs=FLAGS.epochs,
+        validation_data=dataset_validation.batch(1),
+        validation_freq=1,
+        callbacks=callbacks
+    )
     model.summary()
 
-    #Save the trained models.
+    # Save the trained models
     if FLAGS.model_name == 'SESR':
       final_save_path = BASE_SAVE_DIR+FLAGS.model_name+'_m{}_f{}_x{}_fs{}{}{}_{}Training_{}{}'.format(
                            FLAGS.m, FLAGS.int_features, FLAGS.scale, FLAGS.feature_size, "_relu" if FLAGS.relu_act else '', "_comb" if FLAGS.comb_loss else '',
@@ -230,9 +326,7 @@ def main(unused_argv):
                                       output_path=output_path, inputs_as_nchw=["input_1"],
                                       outputs_as_nchw=["output_1"])
 
-
-
-      #Get the TFLITE for custom image size
+      # Get the TFLITE for custom image size
       if FLAGS.gen_tflite:
         y_lr = tf.random.uniform([1, FLAGS.tflite_height, FLAGS.tflite_width, 1],
                                 minval=0., maxval=1.)

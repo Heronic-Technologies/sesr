@@ -131,7 +131,7 @@ def scale_match(lr, hr):
         tf.equal(hr_shape[1], lr_shape[1] * FLAGS.scale),
     )
 
-    # Optional: skip “tiny” images
+    # Optional: skip "tiny" images
     ok_min = tf.logical_and(lr_shape[0] > 2, lr_shape[1] > 2) & tf.logical_and(hr_shape[0] > 2, hr_shape[1] > 2)
 
     return ok_rank & ok_pos & ok_c & ok_scale & ok_min
@@ -233,21 +233,23 @@ def load_hr_only_dataset(data_dir: str, split: str = 'train', scale: int = 2, hr
 
 class LPIPSLoss:
     """
-    Differentiable LPIPS-like perceptual loss in TensorFlow.
+    TensorFlow-native LPIPS-style perceptual loss.
 
-    Inputs:
+    Usage:
         y_true, y_pred: TF tensors [B,H,W,1] or [B,H,W,3] in [0, 1]
 
     Nets:
         - net='vgg'  -> VGG16 (ImageNet) feature loss (classic perceptual loss)
-        - net='mobilenetv2' -> MobileNetV2 (ImageNet) feature loss (acts as an "Alex-like" lightweight backbone)
+        - net='mobilenetv2' -> MobileNetV2 (ImageNet) feature loss (lightweight)
     """
 
     def __init__(self, net='mobilenetv2', use_gpu=True,
                  layer_weights=None,
-                 eps=1e-10):
+                 eps=1e-10,
+                 use_mixed_precision=False):
         self.net = net.lower()
         self.eps = tf.constant(eps, tf.float32)
+        self.use_mixed_precision = use_mixed_precision
 
         if self.net == 'vgg':
             layer_names = [
@@ -296,68 +298,66 @@ class LPIPSLoss:
         self._preprocess = self._preprocess_mobilenetv2
 
     # ---------- Input helpers ----------
+    @tf.function
     def _preprocess_vgg(self, x_01_rgb):
         """
-        VGG16 preprocess:
-          expects RGB in 0..255 and does the standard vgg16.preprocess_input transform.
+        VGG16 preprocess: expects RGB in 0..255 and does the standard vgg16.preprocess_input transform.
         """
         x = tf.clip_by_value(x_01_rgb, 0.0, 1.0) * 255.0
         return tf.keras.applications.vgg16.preprocess_input(x)
 
+    @tf.function
     def _preprocess_mobilenetv2(self, x_01_rgb):
         """
-        MobileNetV2 preprocess:
-          expects RGB in 0..255 then maps to [-1,1] internally.
-        This is close to LPIPS-style input scaling.
+        MobileNetV2 preprocess: expects RGB in 0..255 then maps to [-1,1] internally.
         """
         x = tf.clip_by_value(x_01_rgb, 0.0, 1.0) * 255.0
         return tf.keras.applications.mobilenet_v2.preprocess_input(x)
 
     @staticmethod
+    @tf.function
     def _channelwise_unit_normalize(f, eps):
         """
-        LPIPS-style-ish feature normalization:
-        normalize each spatial position by channel norm.
+        LPIPS-style feature normalization with fused operations
         f: [B,H,W,C]
         """
         denom = tf.sqrt(tf.reduce_sum(tf.square(f), axis=-1, keepdims=True) + eps)
         return f / denom
 
     # ---------- Main call ----------
+    @tf.function
     def __call__(self, y_true, y_pred):
         """
         Returns:
             TF scalar perceptual distance (differentiable w.r.t y_pred)
         """
         # 1) Y -> RGB
-        y_true_rgb = y_to_rgb(y_true)
-        y_pred_rgb = y_to_rgb(y_pred)
+        y_true_rgb = tf.concat([y_true, y_true, y_true], axis=-1)
+        y_pred_rgb = tf.concat([y_pred, y_pred, y_pred], axis=-1)
 
         # 2) Backbone-specific preprocessing
         y_true_in = self._preprocess(y_true_rgb)
         y_pred_in = self._preprocess(y_pred_rgb)
 
-        # 3) Extract features
+        # 3) Extract features (single forward pass)
         ft_list = self.feature_model(y_true_in, training=False)
         fp_list = self.feature_model(y_pred_in, training=False)
         if not isinstance(ft_list, (list, tuple)):
             ft_list, fp_list = [ft_list], [fp_list]
 
-        # 4) LPIPS-like distance: sum over layers of feature differences
-        #    LPIPS-style reductions: mean over C, then over H,W, then over B
-        losses = []
+        # 4) Compute distance with fused operations
+        total_loss = 0.0
         for w, ft, fp in zip(tf.unstack(self.layer_weights), ft_list, fp_list):
+            # Normalize features
             ft_n = self._channelwise_unit_normalize(ft, self.eps)
             fp_n = self._channelwise_unit_normalize(fp, self.eps)
 
-            d = tf.square(ft_n - fp_n)          # [B,H,W,C]
-            d = tf.reduce_mean(d, axis=-1)      # [B,H,W]   mean over channels
-            d = tf.reduce_mean(d, axis=[1, 2])  # [B]       mean over spatial
-            d = tf.reduce_mean(d)               # scalar    mean over batch
+            # Compute squared difference and reduce (fused operations)
+            d = tf.reduce_mean(tf.square(ft_n - fp_n))
+            total_loss += w * d
 
-            losses.append(w * d)
+        return tf.cast(total_loss, tf.float32)
 
-        return tf.add_n(losses)
 
 class LPIPSMetric:
     """
@@ -373,32 +373,35 @@ class LPIPSMetric:
         self.net = net
         self.device = 'cuda' if use_gpu and torch.cuda.is_available() else 'cpu'
 
-        print(f"Initializing LPIPS ({net}) on {self.device}")
-
         # Initialize LPIPS model
         self.loss_fn = lpips.LPIPS(net=net).to(self.device)
         self.loss_fn.eval()  # Set to evaluation mode
 
+        if self.device == 'cuda':
+            torch.backends.cudnn.benchmark = True
+
+    @torch.no_grad()  # Decorator for no gradient tracking
     def _compute_lpips_numpy(self, y_true_np, y_pred_np):
         """
-        Compute LPIPS between Y channel images.
+        LPIPS computation.
 
         Args:
             y_true: [B, H, W, 1] Y channel ground truth in [0, 1]
             y_pred: [B, H, W, 1] Y channel prediction in [0, 1]
 
         Returns:
-            LPIPS distance (scalar, typically 0.0-1.0)
+            LPIPS distance (scalar)
         """
         # Convert Y [B, H, W, 1] to grayscale RGB [B, H, W, 3]
         if y_true_np.shape[-1] == 1:
-            y_true_rgb = np.concatenate([y_true_np, y_true_np, y_true_np], axis=-1)
+            y_true_rgb = np.repeat(y_true_np, 3, axis=-1)
         elif y_true_np.shape[-1] == 3:
             y_true_rgb = y_true_np
         else:
             raise ValueError(f"Expected y_true to have 1 or 3 channels, got {y_true_np.shape[-1]}")
+
         if y_pred_np.shape[-1] == 1:
-            y_pred_rgb = np.concatenate([y_pred_np, y_pred_np, y_pred_np], axis=-1)
+            y_pred_rgb = np.repeat(y_pred_np, 3, axis=-1)
         elif y_pred_np.shape[-1] == 3:
             y_pred_rgb = y_pred_np
         else:
@@ -409,16 +412,19 @@ class LPIPSMetric:
         y_pred_rgb = np.transpose(y_pred_rgb, (0, 3, 1, 2))
 
         # Convert to PyTorch tensors in [-1, 1] range
-        y_true_torch = torch.from_numpy(y_true_rgb).float().to(self.device)
-        y_pred_torch = torch.from_numpy(y_pred_rgb).float().to(self.device)
+        y_true_torch = torch.from_numpy(y_true_rgb).float()
+        y_pred_torch = torch.from_numpy(y_pred_rgb).float()
 
         # Scale from [0, 1] to [-1, 1]
         y_true_torch = y_true_torch * 2.0 - 1.0
         y_pred_torch = y_pred_torch * 2.0 - 1.0
 
+        # Move to device
+        y_true_torch = y_true_torch.to(self.device, non_blocking=True)
+        y_pred_torch = y_pred_torch.to(self.device, non_blocking=True)
+
         # Compute LPIPS
-        with torch.no_grad():
-            distance = self.loss_fn(y_true_torch, y_pred_torch)
+        distance = self.loss_fn(y_true_torch, y_pred_torch)
 
         # Return mean distance as numpy float
         return np.float32(distance.mean().cpu().numpy())
