@@ -102,8 +102,8 @@ def main(unused_argv):
                                     data_dir=data_dir)
     else:
         # Option 1: Custom LR/HR pairs
-        dataset_train = utils.load_custom_dataset('datasets/DF2K', 'train', lr_folder_suffix=f'{FLAGS.scale}x_{DEGRADATION_METHOD}', lr_file_suffix=f'x{FLAGS.scale}')
-        dataset_validation = utils.load_custom_dataset('datasets/DF2K', 'val', lr_folder_suffix=f'{FLAGS.scale}x_{DEGRADATION_METHOD}', lr_file_suffix=f'x{FLAGS.scale}')
+        dataset_train = utils.load_custom_dataset('datasets/ise_finetune_dataset', 'train', lr_folder_suffix=f'{FLAGS.scale}x_{DEGRADATION_METHOD}', lr_file_suffix='')
+        dataset_validation = utils.load_custom_dataset('datasets/ise_finetune_dataset', 'val', lr_folder_suffix=f'{FLAGS.scale}x_{DEGRADATION_METHOD}', lr_file_suffix='')
 
         # Option 2: Custom HR only (auto-generate LR)
         # dataset_train = utils.load_hr_only_dataset('datasets/hr_only_example_dataset', 'train', scale=FLAGS.scale)
@@ -268,6 +268,45 @@ def main(unused_argv):
             metrics=compile_metrics,
         )
 
+    class ValidationLPIPSCallback(tf.keras.callbacks.Callback):
+        def __init__(self, validation_data, metric_fn):
+            super().__init__()
+            self.validation_data = validation_data
+            self.metric_fn = metric_fn
+
+        def on_epoch_end(self, epoch, logs=None):
+            if self.metric_fn is not None:
+                # Compute LPIPS on validation set
+                lpips_values = []
+                for lr, hr in self.validation_data.take(10):  # Sample 10 images
+                    pred = self.model(lr, training=False)
+                    hr_rgb = utils.y_to_rgb(hr)
+                    pred_rgb = utils.y_to_rgb(pred)
+                    lpips_val = self.metric_fn(hr_rgb, pred_rgb)
+                    lpips_values.append(float(lpips_val))
+
+                avg_lpips = sum(lpips_values) / len(lpips_values)
+                logs['val_lpips'] = avg_lpips
+                print(f"\n{Fore.CYAN}Validation LPIPS: {avg_lpips:.4f}")
+
+    callbacks = []
+
+    if FLAGS.skip_lpips_metric:
+        if lpips_metric is None:
+            print(f"{Fore.YELLOW}Initializing LPIPS metric for validation...")
+            lpips_metric = utils.LPIPSMetric(net='alex')
+        callbacks.append(ValidationLPIPSCallback(dataset_validation.batch(1), lpips_metric))
+
+    log_dir = os.path.join("tensorboard_logs", "{}_m{}_f{}_x{}_fs{}{}{}_{}Training_{}{}".format(FLAGS.model_name, FLAGS.m, FLAGS.int_features, FLAGS.scale, FLAGS.feature_size, "_relu" if FLAGS.relu_act else '', "_comb" if FLAGS.comb_loss else '', FLAGS.linear_block_type, SUFFIX, f'_custom_{DEGRADATION_METHOD}' if CUSTOM_DATASET else ''))
+    tensorboard_callback = tf.keras.callbacks.TensorBoard(
+        log_dir=log_dir,
+        histogram_freq=0,
+        write_graph=False,
+        update_freq='epoch',
+    )
+    callbacks.append(tensorboard_callback)
+
+
     # Train the model
     print(f"{Fore.GREEN}Starting training with optimizations:")
     print(f"  - Mixed precision: {FLAGS.use_mixed_precision}")
@@ -279,6 +318,7 @@ def main(unused_argv):
         epochs=FLAGS.epochs,
         validation_data=dataset_validation.batch(1),
         validation_freq=1,
+        callbacks=callbacks,
     )
     model.summary()
 
