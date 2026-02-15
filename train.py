@@ -128,7 +128,7 @@ def main(unused_argv):
     def combined_loss(y_true: tf.Tensor, y_pred: tf.Tensor) -> tf.Tensor:
         l1 = l1_loss(y_true, y_pred)
         p = perceptual_loss(y_true, y_pred)
-        return l1 + 1.5 * p # lambda factor of 1.5 works well with LPIPS in mobilenetv2 on the DF2K dataset. For other backbones/datasets, this may need to be tuned for best results.
+        return l1 + 1.2 * p # lambda factor of 1.2 works well with LPIPS in mobilenetv2 on the DF2K dataset. For other backbones/datasets, this may need to be tuned for best results.
 
     if FLAGS.eval_only:
         print(f"{Fore.CYAN}Running validation only...")
@@ -212,7 +212,7 @@ def main(unused_argv):
     model.fit(dataset_train.batch(FLAGS.batch_size),
               epochs=FLAGS.epochs,
               validation_data=dataset_validation.batch(1),
-              validation_freq=10)
+              validation_freq=1)
     model.summary()
 
     #Save the trained models.

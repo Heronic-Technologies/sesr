@@ -344,13 +344,18 @@ class LPIPSLoss:
             ft_list, fp_list = [ft_list], [fp_list]
 
         # 4) LPIPS-like distance: sum over layers of feature differences
-        #    Using L2 on channel-normalized features (stable for SR).
+        #    LPIPS-style reductions: mean over C, then over H,W, then over B
         losses = []
         for w, ft, fp in zip(tf.unstack(self.layer_weights), ft_list, fp_list):
             ft_n = self._channelwise_unit_normalize(ft, self.eps)
             fp_n = self._channelwise_unit_normalize(fp, self.eps)
-            # mean over batch + spatial + channels
-            losses.append(w * tf.reduce_mean(tf.square(ft_n - fp_n)))
+
+            d = tf.square(ft_n - fp_n)          # [B,H,W,C]
+            d = tf.reduce_mean(d, axis=-1)      # [B,H,W]   mean over channels
+            d = tf.reduce_mean(d, axis=[1, 2])  # [B]       mean over spatial
+            d = tf.reduce_mean(d)               # scalar    mean over batch
+
+            losses.append(w * d)
 
         return tf.add_n(losses)
 
