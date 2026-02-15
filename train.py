@@ -268,34 +268,6 @@ def main(unused_argv):
             metrics=compile_metrics,
         )
 
-    # Custom callback for LPIPS on validation only
-    class ValidationLPIPSCallback(tf.keras.callbacks.Callback):
-        def __init__(self, validation_data):
-            super().__init__()
-            self.validation_data = validation_data
-
-        def on_epoch_end(self, epoch, logs=None):
-            if FLAGS.skip_lpips_metric and lpips_metric is not None:
-                # Compute LPIPS on validation set
-                lpips_values = []
-                for lr, hr in self.validation_data:
-                    pred = self.model(lr, training=False)
-                    hr_rgb = utils.y_to_rgb(hr)
-                    pred_rgb = utils.y_to_rgb(pred)
-                    lpips_val = lpips_metric(hr_rgb, pred_rgb)
-                    lpips_values.append(float(lpips_val))
-
-                avg_lpips = sum(lpips_values) / len(lpips_values)
-                logs['val_lpips'] = avg_lpips
-                print(f"\n{Fore.CYAN}Validation LPIPS: {avg_lpips:.4f}")
-
-    callbacks = []
-    if FLAGS.skip_lpips_metric:
-        # Only add callback if we have the metric initialized
-        if lpips_metric is None:
-            lpips_metric = utils.LPIPSMetric(net='alex')
-        callbacks.append(ValidationLPIPSCallback(dataset_validation.batch(1)))
-
     # Train the model
     print(f"{Fore.GREEN}Starting training with optimizations:")
     print(f"  - Mixed precision: {FLAGS.use_mixed_precision}")
@@ -307,7 +279,6 @@ def main(unused_argv):
         epochs=FLAGS.epochs,
         validation_data=dataset_validation.batch(1),
         validation_freq=1,
-        callbacks=callbacks
     )
     model.summary()
 
