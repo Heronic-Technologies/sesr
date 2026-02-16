@@ -290,14 +290,17 @@ def main(unused_argv):
                 print(f"\n{Fore.CYAN}Validation LPIPS: {avg_lpips:.4f}")
 
     class AdaptiveLPIPSScheduler(tf.keras.callbacks.Callback):
-        def __init__(self, start_weight=0.0, end_weight=0.05, ramp_epochs=10):
+        def __init__(self, start_weight=0.0, end_weight=0.05, start_epoch=5, ramp_epochs=35):
             super().__init__()
             self.start_weight = start_weight
             self.end_weight = end_weight
+            self.start_epoch = start_epoch
             self.ramp_epochs = ramp_epochs
 
         def on_epoch_begin(self, epoch, logs=None):
-            if epoch < self.ramp_epochs:
+            if epoch < self.start_epoch:
+                current_weight = self.start_weight
+            elif epoch < self.start_epoch + self.ramp_epochs:
                 progress = epoch / self.ramp_epochs
                 current_weight = self.start_weight + (self.end_weight - self.start_weight) * progress
             else:
@@ -325,7 +328,7 @@ def main(unused_argv):
     )
 
     callbacks.append(tensorboard_callback)
-    callbacks.append(AdaptiveLPIPSScheduler(start_weight=0.0, end_weight=0.05, ramp_epochs=10))
+    callbacks.append(AdaptiveLPIPSScheduler(start_weight=0.0, end_weight=0.05, start_epoch=5, ramp_epochs=35))
 
     # Train the model
     print(f"{Fore.GREEN}Starting training with optimizations:")
