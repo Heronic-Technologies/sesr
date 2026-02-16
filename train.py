@@ -82,6 +82,7 @@ def main(unused_argv):
         net='mobilenetv2',
         use_mixed_precision=FLAGS.use_mixed_precision
     )
+    lpips_weight_var = tf.Variable(0.0, trainable=False)
 
     lpips_metric = None
     if not FLAGS.skip_lpips_metric:
@@ -101,9 +102,8 @@ def main(unused_argv):
                                     split=['train', 'validation'], shuffle_files=True,
                                     data_dir=data_dir)
     else:
-        # Option 1: Custom LR/HR pairs
-        dataset_train = utils.load_custom_dataset('datasets/ise_finetune_dataset', 'train', lr_folder_suffix=f'{FLAGS.scale}x_{DEGRADATION_METHOD}', lr_file_suffix='')
-        dataset_validation = utils.load_custom_dataset('datasets/ise_finetune_dataset', 'val', lr_folder_suffix=f'{FLAGS.scale}x_{DEGRADATION_METHOD}', lr_file_suffix='')
+        dataset_train = utils.load_custom_dataset('datasets/DF2K', 'train', lr_folder_suffix=f'{FLAGS.scale}x_{DEGRADATION_METHOD}', lr_file_suffix=f'x{FLAGS.scale}')
+        dataset_validation = utils.load_custom_dataset('datasets/DF2K', 'val', lr_folder_suffix=f'{FLAGS.scale}x_{DEGRADATION_METHOD}', lr_file_suffix=f'x{FLAGS.scale}')
 
         # Option 2: Custom HR only (auto-generate LR)
         # dataset_train = utils.load_hr_only_dataset('datasets/hr_only_example_dataset', 'train', scale=FLAGS.scale)
@@ -156,7 +156,7 @@ def main(unused_argv):
         p = perceptual_loss(y_true, y_pred)
         l1 = tf.cast(l1, tf.float32)
         p = tf.cast(p, tf.float32)
-        return l1 + 1.2 * p
+        return l1 + lpips_weight_var * p
 
     if FLAGS.eval_only:
         print(f"{Fore.CYAN}Running validation only...")
@@ -289,13 +289,32 @@ def main(unused_argv):
                 logs['val_lpips'] = avg_lpips
                 print(f"\n{Fore.CYAN}Validation LPIPS: {avg_lpips:.4f}")
 
+    class AdaptiveLPIPSScheduler(tf.keras.callbacks.Callback):
+        def __init__(self, start_weight=0.0, end_weight=0.05, ramp_epochs=10):
+            super().__init__()
+            self.start_weight = start_weight
+            self.end_weight = end_weight
+            self.ramp_epochs = ramp_epochs
+
+        def on_epoch_begin(self, epoch, logs=None):
+            if epoch < self.ramp_epochs:
+                progress = epoch / self.ramp_epochs
+                current_weight = self.start_weight + (self.end_weight - self.start_weight) * progress
+            else:
+                current_weight = self.end_weight
+
+            lpips_weight_var.assign(current_weight)
+
+            print(f"\nEpoch {epoch + 1} - LPIPS weight: {current_weight:.6f}")
+
+
     callbacks = []
 
-    if FLAGS.skip_lpips_metric:
-        if lpips_metric is None:
-            print(f"{Fore.YELLOW}Initializing LPIPS metric for validation...")
-            lpips_metric = utils.LPIPSMetric(net='alex')
-        callbacks.append(ValidationLPIPSCallback(dataset_validation.batch(1), lpips_metric))
+    # if FLAGS.skip_lpips_metric:
+    #     if lpips_metric is None:
+    #         print(f"{Fore.YELLOW}Initializing LPIPS metric for validation...")
+    #         lpips_metric = utils.LPIPSMetric(net='alex')
+    #     callbacks.append(ValidationLPIPSCallback(dataset_validation.batch(1), lpips_metric))
 
     log_dir = os.path.join("tensorboard_logs", "{}_m{}_f{}_x{}_fs{}{}{}_{}Training_{}{}".format(FLAGS.model_name, FLAGS.m, FLAGS.int_features, FLAGS.scale, FLAGS.feature_size, "_relu" if FLAGS.relu_act else '', "_comb" if FLAGS.comb_loss else '', FLAGS.linear_block_type, SUFFIX, f'_custom_{DEGRADATION_METHOD}' if CUSTOM_DATASET else ''))
     tensorboard_callback = tf.keras.callbacks.TensorBoard(
@@ -304,8 +323,9 @@ def main(unused_argv):
         write_graph=False,
         update_freq='epoch',
     )
-    callbacks.append(tensorboard_callback)
 
+    callbacks.append(tensorboard_callback)
+    callbacks.append(AdaptiveLPIPSScheduler(start_weight=0.0, end_weight=0.05, ramp_epochs=10))
 
     # Train the model
     print(f"{Fore.GREEN}Starting training with optimizations:")
@@ -317,7 +337,7 @@ def main(unused_argv):
         dataset_train.batch(FLAGS.batch_size),
         epochs=FLAGS.epochs,
         validation_data=dataset_validation.batch(1),
-        validation_freq=1,
+        validation_freq=5,
         callbacks=callbacks,
     )
     model.summary()
