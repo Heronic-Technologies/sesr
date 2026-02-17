@@ -310,10 +310,10 @@ def main(unused_argv):
 
     callbacks = []
 
-    if FLAGS.skip_lpips_metric:
-        if lpips_metric is None:
-            lpips_metric = utils.LPIPSMetric(net='alex')
-        callbacks.append(ValidationLPIPSCallback(dataset_validation.batch(1), lpips_metric))
+    # if FLAGS.skip_lpips_metric:
+    #     if lpips_metric is None:
+    #         lpips_metric = utils.LPIPSMetric(net='alex')
+    #     callbacks.append(ValidationLPIPSCallback(dataset_validation.batch(1), lpips_metric))
 
     log_dir = os.path.join("tensorboard_logs", "{}_m{}_f{}_x{}_fs{}{}{}_{}Training_{}{}".format(FLAGS.model_name, FLAGS.m, FLAGS.int_features, FLAGS.scale, FLAGS.feature_size, "_relu" if FLAGS.relu_act else '', "_comb" if FLAGS.comb_loss else '', FLAGS.linear_block_type, SUFFIX, f'_custom_{DEGRADATION_METHOD}' if CUSTOM_DATASET else ''))
     tensorboard_callback = tf.keras.callbacks.TensorBoard(
