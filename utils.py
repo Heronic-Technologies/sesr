@@ -364,7 +364,7 @@ class LPIPSMetric:
     PyTorch LPIPS wrapper for TensorFlow/Y-channel.
     """
 
-    def __init__(self, net='alex', use_gpu=True):
+    def __init__(self, net='alex', use_gpu=False):
         """
         Args:
             net: 'alex', 'vgg', or 'squeeze'
@@ -392,6 +392,9 @@ class LPIPSMetric:
         Returns:
             LPIPS distance (scalar)
         """
+        y_true_np = np.array(y_true_np, copy=True)
+        y_pred_np = np.array(y_pred_np, copy=True)
+
         # Convert Y [B, H, W, 1] to grayscale RGB [B, H, W, 3]
         if y_true_np.shape[-1] == 1:
             y_true_rgb = np.repeat(y_true_np, 3, axis=-1)
@@ -447,7 +450,4 @@ class LPIPSMetric:
             Tout=tf.float32
         )
 
-        # Ensure it's a scalar
-        lpips_value = tf.reshape(lpips_value, [])
-
-        return tf.stop_gradient(lpips_value)
+        return tf.stop_gradient(tf.reshape(lpips_value, []))

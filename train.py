@@ -77,6 +77,15 @@ if FLAGS.scale == 4: #Specify path to load x2 models (x4 SISR will only finetune
 ##################################
 
 def main(unused_argv):
+    # Configure GPU memory allocation.
+    gpus = tf.config.list_physical_devices('GPU')
+    if gpus:
+        try:
+            for gpu in gpus:
+                tf.config.experimental.set_memory_growth(gpu, True)
+        except RuntimeError as e:
+            print(e)
+
     # Initialize metrics and losses with optimizations
     lpips_loss = utils.LPIPSLoss(
         net='mobilenetv2',
@@ -131,10 +140,8 @@ def main(unused_argv):
     def psnr(y_true: tf.Tensor, y_pred: tf.Tensor) -> tf.Tensor:
         return tf.image.psnr(y_true, y_pred, max_val=1.)
 
-    # LPIPS metric wrapper (only used if not skipped).
+    @tf.function
     def lpips(y_true: tf.Tensor, y_pred: tf.Tensor) -> tf.Tensor:
-        if FLAGS.skip_lpips_metric:
-            return tf.constant("N/A", dtype=tf.string)  # Return dummy value during training
         y_true_rgb = utils.y_to_rgb(y_true)
         y_pred_rgb = utils.y_to_rgb(y_pred)
         return lpips_metric(y_true_rgb, y_pred_rgb)
@@ -145,6 +152,7 @@ def main(unused_argv):
         return tf.cast(loss, tf.float32)
 
     # Perceptual loss is always computed via TF
+    @tf.function
     def perceptual_loss(y_true: tf.Tensor, y_pred: tf.Tensor) -> tf.Tensor:
         loss = lpips_loss(y_true, y_pred)
         return tf.cast(loss, tf.float32)
@@ -163,16 +171,11 @@ def main(unused_argv):
 
         # For evaluation, always compute LPIPS metric
         if lpips_metric is None:
-            lpips_metric = utils.LPIPSMetric(net='alex')
-
-        def lpips_eval(y_true: tf.Tensor, y_pred: tf.Tensor) -> tf.Tensor:
-            y_true_rgb = utils.y_to_rgb(y_true)
-            y_pred_rgb = utils.y_to_rgb(y_pred)
-            return lpips_metric(y_true_rgb, y_pred_rgb)
+            lpips_metric = utils.LPIPSMetric(net='alex', use_gpu=True)
 
         model = tf.keras.models.load_model(
             FLAGS.model_path,
-            custom_objects={'psnr': psnr, 'lpips': lpips_eval, 'combined_loss': combined_loss}
+            custom_objects={'psnr': psnr, 'lpips': lpips, 'l1_loss': l1_loss, 'perceptual_loss': perceptual_loss, 'combined_loss': combined_loss}
         )
 
         results = model.evaluate(
@@ -221,11 +224,11 @@ def main(unused_argv):
         print(f"{Fore.CYAN}Loading model from {FLAGS.model_path} for finetuning on custom dataset...")
         model = tf.keras.models.load_model(
             FLAGS.model_path,
-            custom_objects={'psnr': psnr, 'lpips': lpips, 'combined_loss': combined_loss}
+            custom_objects={'psnr': psnr, 'lpips': lpips, 'l1_loss': l1_loss, 'perceptual_loss': perceptual_loss, 'combined_loss': combined_loss}
         )
       else:
         print(f"{Fore.CYAN}Loading x2 model from {PATH_2X} for training the x4 model...")
-        base_model = tf.keras.models.load_model(PATH_2X, custom_objects={'psnr': psnr, 'lpips': lpips, 'combined_loss': combined_loss})
+        base_model = tf.keras.models.load_model(PATH_2X, custom_objects={'psnr': psnr, 'lpips': lpips, 'l1_loss': l1_loss, 'perceptual_loss': perceptual_loss, 'combined_loss': combined_loss})
         layer_dict = dict([(layer.name, layer) for layer in base_model.layers])
         for layer in model.layers:
           layer_name = layer.name
@@ -239,7 +242,7 @@ def main(unused_argv):
         print(f"{Fore.CYAN}Loading model from {FLAGS.model_path} for finetuning on custom dataset...")
         model = tf.keras.models.load_model(
             FLAGS.model_path,
-            custom_objects={'psnr': psnr, 'lpips': lpips, 'combined_loss': combined_loss}
+            custom_objects={'psnr': psnr, 'lpips': lpips, 'l1_loss': l1_loss, 'perceptual_loss': perceptual_loss, 'combined_loss': combined_loss}
         )
 
     # Compile the model.
@@ -249,24 +252,20 @@ def main(unused_argv):
             compile_metrics = [l1_loss, perceptual_loss, psnr]
         else:
             compile_metrics = [l1_loss, perceptual_loss, psnr, lpips]
-
-        model.compile(
-            optimizer=optimizer,
-            loss=combined_loss,
-            metrics=compile_metrics,
-        )
+        loss_function = combined_loss
     else:
         print(f"{Fore.CYAN}Using L1 loss for training.")
         if FLAGS.skip_lpips_metric:
-            compile_metrics = [l1_loss, perceptual_loss, psnr]
+            compile_metrics = [psnr]
         else:
-            compile_metrics = [l1_loss, perceptual_loss, psnr, lpips]
+            compile_metrics = [psnr, lpips]
+        loss_function = "mae"
 
-        model.compile(
-            optimizer=optimizer,
-            loss='mae',
-            metrics=compile_metrics,
-        )
+    model.compile(
+        optimizer=optimizer,
+        loss=loss_function,
+        metrics=compile_metrics,
+    )
 
     class ValidationLPIPSCallback(tf.keras.callbacks.Callback):
         def __init__(self, validation_data, metric_fn):
@@ -278,11 +277,9 @@ def main(unused_argv):
             if self.metric_fn is not None:
                 # Compute LPIPS on validation set
                 lpips_values = []
-                for lr, hr in self.validation_data.take(10):  # Sample 10 images
+                for lr, hr in self.validation_data.take(10):
                     pred = self.model(lr, training=False)
-                    hr_rgb = utils.y_to_rgb(hr)
-                    pred_rgb = utils.y_to_rgb(pred)
-                    lpips_val = self.metric_fn(hr_rgb, pred_rgb)
+                    lpips_val = self.metric_fn(hr, pred)
                     lpips_values.append(float(lpips_val))
 
                 avg_lpips = sum(lpips_values) / len(lpips_values)
@@ -290,7 +287,7 @@ def main(unused_argv):
                 print(f"\n{Fore.CYAN}Validation LPIPS: {avg_lpips:.4f}")
 
     class AdaptiveLPIPSScheduler(tf.keras.callbacks.Callback):
-        def __init__(self, start_weight=0.0, end_weight=0.05, start_epoch=5, ramp_epochs=35):
+        def __init__(self, start_weight=0.0, end_weight=0.05, start_epoch=5, ramp_epochs=45):
             super().__init__()
             self.start_weight = start_weight
             self.end_weight = end_weight
@@ -313,11 +310,10 @@ def main(unused_argv):
 
     callbacks = []
 
-    # if FLAGS.skip_lpips_metric:
-    #     if lpips_metric is None:
-    #         print(f"{Fore.YELLOW}Initializing LPIPS metric for validation...")
-    #         lpips_metric = utils.LPIPSMetric(net='alex')
-    #     callbacks.append(ValidationLPIPSCallback(dataset_validation.batch(1), lpips_metric))
+    if FLAGS.skip_lpips_metric:
+        if lpips_metric is None:
+            lpips_metric = utils.LPIPSMetric(net='alex')
+        callbacks.append(ValidationLPIPSCallback(dataset_validation.batch(1), lpips_metric))
 
     log_dir = os.path.join("tensorboard_logs", "{}_m{}_f{}_x{}_fs{}{}{}_{}Training_{}{}".format(FLAGS.model_name, FLAGS.m, FLAGS.int_features, FLAGS.scale, FLAGS.feature_size, "_relu" if FLAGS.relu_act else '', "_comb" if FLAGS.comb_loss else '', FLAGS.linear_block_type, SUFFIX, f'_custom_{DEGRADATION_METHOD}' if CUSTOM_DATASET else ''))
     tensorboard_callback = tf.keras.callbacks.TensorBoard(
@@ -328,7 +324,7 @@ def main(unused_argv):
     )
 
     callbacks.append(tensorboard_callback)
-    callbacks.append(AdaptiveLPIPSScheduler(start_weight=0.0, end_weight=0.05, start_epoch=5, ramp_epochs=35))
+    callbacks.append(AdaptiveLPIPSScheduler(start_weight=0.0, end_weight=0.05, start_epoch=5, ramp_epochs=FLAGS.epochs-10))
 
     # Train the model
     print(f"{Fore.GREEN}Starting training with optimizations:")
@@ -350,6 +346,9 @@ def main(unused_argv):
       final_save_path = BASE_SAVE_DIR+FLAGS.model_name+'_m{}_f{}_x{}_fs{}{}{}_{}Training_{}{}'.format(
                            FLAGS.m, FLAGS.int_features, FLAGS.scale, FLAGS.feature_size, "_relu" if FLAGS.relu_act else '', "_comb" if FLAGS.comb_loss else '',
                            FLAGS.linear_block_type, SUFFIX, f'_custom_{DEGRADATION_METHOD}' if CUSTOM_DATASET else '')
+      if FLAGS.comb_loss:
+        print(f"{Fore.CYAN}Recompile with plain 'mae' loss before saving.")
+        model.compile(optimizer=optimizer, loss='mae', metrics=compile_metrics + [lpips])
       model.save(final_save_path)
       model.save_weights(final_save_path + '/model_weights')
 
