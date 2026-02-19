@@ -118,15 +118,20 @@ def main(unused_argv):
         # dataset_train = utils.load_hr_only_dataset('datasets/hr_only_example_dataset', 'train', scale=FLAGS.scale)
         # dataset_validation = utils.load_hr_only_dataset('datasets/hr_only_example_dataset', 'val', scale=FLAGS.scale)
 
-    dataset_train = dataset_train.prefetch(buffer_size=tf.data.experimental.AUTOTUNE)
-    dataset_train = dataset_train.map(utils.rgb_to_y, num_parallel_calls=tf.data.AUTOTUNE).cache()
+    dataset_train = dataset_train.map(utils.rgb_to_y, num_parallel_calls=tf.data.AUTOTUNE)
     dataset_train = dataset_train.filter(utils.scale_match)
     dataset_train = dataset_train.map(utils.patches, num_parallel_calls=tf.data.AUTOTUNE)
-    dataset_train = dataset_train.unbatch().shuffle(buffer_size=1_000)
+    dataset_train = dataset_train.unbatch()
+    dataset_train = dataset_train.cache()
+    dataset_train = dataset_train.shuffle(buffer_size=10_000)
+    dataset_train = dataset_train.batch(FLAGS.batch_size)
+    dataset_train = dataset_train.prefetch(buffer_size=tf.data.AUTOTUNE)
 
-    dataset_validation = dataset_validation.prefetch(buffer_size=tf.data.experimental.AUTOTUNE)
-    dataset_validation = dataset_validation.map(utils.rgb_to_y, num_parallel_calls=tf.data.AUTOTUNE).cache()
+    dataset_validation = dataset_validation.map(utils.rgb_to_y, num_parallel_calls=tf.data.AUTOTUNE)
     dataset_validation = dataset_validation.filter(utils.scale_match)
+    dataset_validation = dataset_validation.cache()
+    dataset_validation = dataset_validation.batch(1)
+    dataset_validation = dataset_validation.prefetch(buffer_size=tf.data.AUTOTUNE)
 
     # Set sharding policy to DATA to avoid auto-sharding warnings with custom datasets
     if CUSTOM_DATASET:
@@ -161,7 +166,11 @@ def main(unused_argv):
     @tf.function
     def combined_loss(y_true: tf.Tensor, y_pred: tf.Tensor) -> tf.Tensor:
         l1 = l1_loss(y_true, y_pred)
-        p = perceptual_loss(y_true, y_pred)
+        p = tf.cond(
+            lpips_weight_var > 1e-6,
+            true_fn=lambda: perceptual_loss(y_true, y_pred),
+            false_fn=lambda: tf.constant(0.0)
+        )
         l1 = tf.cast(l1, tf.float32)
         p = tf.cast(p, tf.float32)
         return l1 + lpips_weight_var * p
@@ -179,7 +188,7 @@ def main(unused_argv):
         )
 
         results = model.evaluate(
-            dataset_validation.batch(1),
+            dataset_validation,
             verbose=1
         )
 
@@ -287,7 +296,7 @@ def main(unused_argv):
                 print(f"\n{Fore.CYAN}Validation LPIPS: {avg_lpips:.4f}")
 
     class AdaptiveLPIPSScheduler(tf.keras.callbacks.Callback):
-        def __init__(self, start_weight=0.0, end_weight=0.05, start_epoch=5, ramp_epochs=45):
+        def __init__(self, start_weight=0.001, end_weight=0.05, start_epoch=5, ramp_epochs=45):
             super().__init__()
             self.start_weight = start_weight
             self.end_weight = end_weight
@@ -296,9 +305,9 @@ def main(unused_argv):
 
         def on_epoch_begin(self, epoch, logs=None):
             if epoch < self.start_epoch:
-                current_weight = self.start_weight
+                current_weight = 0.0
             elif epoch < self.start_epoch + self.ramp_epochs:
-                progress = epoch / self.ramp_epochs
+                progress = (epoch - self.start_epoch) / self.ramp_epochs
                 current_weight = self.start_weight + (self.end_weight - self.start_weight) * progress
             else:
                 current_weight = self.end_weight
@@ -324,7 +333,7 @@ def main(unused_argv):
     )
 
     callbacks.append(tensorboard_callback)
-    callbacks.append(AdaptiveLPIPSScheduler(start_weight=0.0, end_weight=0.05, start_epoch=5, ramp_epochs=FLAGS.epochs-10))
+    callbacks.append(AdaptiveLPIPSScheduler(start_weight=0.001, end_weight=0.05, start_epoch=10, ramp_epochs=FLAGS.epochs-20))
 
     # Train the model
     print(f"{Fore.GREEN}Starting training with optimizations:")
@@ -333,9 +342,9 @@ def main(unused_argv):
     print(f"  - Batch size: {FLAGS.batch_size}")
 
     model.fit(
-        dataset_train.batch(FLAGS.batch_size),
+        dataset_train,
         epochs=FLAGS.epochs,
-        validation_data=dataset_validation.batch(1),
+        validation_data=dataset_validation,
         validation_freq=5,
         callbacks=callbacks,
     )
