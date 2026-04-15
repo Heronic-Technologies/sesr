@@ -28,16 +28,15 @@ from colorama import Fore, init
 init(autoreset=True)
 
 FLAGS = tf.compat.v1.flags.FLAGS
-tf.compat.v1.flags.DEFINE_integer('scale', 2, 'Scale of SISR')
+tf.compat.v1.flags.DEFINE_integer("scale", 2, "Scale of SISR")
 
-#Set some dataset related parameters
+# Set some dataset related parameters
 SCALE = FLAGS.scale
-if SCALE != 2 and SCALE != 4:
-  raise ValueError('Only x2 or x4 SISR is currently supported')
-# PATCH_SIZE_HR = 128 if SCALE == 2 else 200
-PATCH_SIZE_HR = 128 if SCALE == 2 else 256
-# PATCH_SIZE_HR = 128 if SCALE == 2 else 384
-PATCH_SIZE_LR = PATCH_SIZE_HR // SCALE
+# PATCH_SIZE_HR must be divisible by SCALE so that PATCH_SIZE_LR is an integer.
+
+PATCH_SIZE_LR = {2: 48, 3: 64, 4: 96}.get(SCALE, 64)
+PATCH_SIZE_LR = 64  # Set to 64 for all scales universally.
+PATCH_SIZE_HR = PATCH_SIZE_LR * SCALE
 PATCHES_PER_IMAGE = 64
 
 
@@ -46,71 +45,92 @@ PATCHES_PER_IMAGE = 64
 ###########################
 
 
-#Convert RGB image to YCbCr
+# Convert RGB image to YCbCr
 def rgb_to_ycbcr(rgb: tf.Tensor) -> tf.Tensor:
-    ycbcr_from_rgb = tf.constant([[65.481, 128.553, 24.966],
-                                  [-37.797, -74.203, 112.0],
-                                  [112.0, -93.786, -18.214]])
-    rgb = tf.cast(rgb, dtype=tf.dtypes.float32) / 255.
+    ycbcr_from_rgb = tf.constant(
+        [
+            [65.481, 128.553, 24.966],
+            [-37.797, -74.203, 112.0],
+            [112.0, -93.786, -18.214],
+        ]
+    )
+    rgb = tf.cast(rgb, dtype=tf.dtypes.float32) / 255.0
     ycbcr = tf.linalg.matmul(rgb, ycbcr_from_rgb, transpose_b=True)
-    return ycbcr + tf.constant([[[16., 128., 128.]]])
+    return ycbcr + tf.constant([[[16.0, 128.0, 128.0]]])
 
-#Convert YCbCr image to RGB
+
+# Convert YCbCr image to RGB
 def ycbcr_to_rgb(ycbcr: tf.Tensor) -> tf.Tensor:
-    rgb_from_ycbcr = tf.constant([[0.00456621, 0.00456621, 0.00456621],
-                                  [0, -0.00153632, 0.00791071],
-                                  [0.00625893, -0.00318811, 0]])
+    rgb_from_ycbcr = tf.constant(
+        [
+            [0.00456621, 0.00456621, 0.00456621],
+            [0, -0.00153632, 0.00791071],
+            [0.00625893, -0.00318811, 0],
+        ]
+    )
 
-    ycbcr = ycbcr - tf.constant([[[16., 128., 128.]]])
+    ycbcr = ycbcr - tf.constant([[[16.0, 128.0, 128.0]]])
     rgb = tf.linalg.matmul(ycbcr, rgb_from_ycbcr, transpose_b=True)
-    rgb = tf.clip_by_value(rgb, 0., 1.)
+    rgb = tf.clip_by_value(rgb, 0.0, 1.0)
     return rgb
 
-#Get the Y-Channel only
+
+# Get the Y-Channel only
 def rgb_to_y(example: tfds.features.FeaturesDict) -> Tuple[tf.Tensor, tf.Tensor]:
-    lr_ycbcr = rgb_to_ycbcr(example['lr'])
-    hr_ycbcr = rgb_to_ycbcr(example['hr'])
-    return lr_ycbcr[..., 0:1] / 255., hr_ycbcr[..., 0:1] / 255.
+    lr_ycbcr = rgb_to_ycbcr(example["lr"])
+    hr_ycbcr = rgb_to_ycbcr(example["hr"])
+    return lr_ycbcr[..., 0:1] / 255.0, hr_ycbcr[..., 0:1] / 255.0
 
 
-#Convert Y-Channel to RGB (replicate Y across 3 channels)
+# Convert Y-Channel to RGB (replicate Y across 3 channels)
 def y_to_rgb(y: tf.Tensor) -> tf.Tensor:
     rgb = tf.concat([y, y, y], axis=-1)
     return rgb
 
-#Extract random patches for training
+
+# Extract random patches for training
 def random_patch(lr: tf.Tensor, hr: tf.Tensor) -> Tuple[tf.Tensor, tf.Tensor]:
     def lr_offset(axis: int):
         size = tf.shape(lr)[axis]
-        return tf.random.uniform(shape=(), maxval=size - PATCH_SIZE_LR,
-                                 dtype=tf.dtypes.int32)
+        return tf.random.uniform(
+            shape=(), maxval=size - PATCH_SIZE_LR, dtype=tf.dtypes.int32
+        )
 
     lr_offset_x, lr_offset_y = lr_offset(axis=0), lr_offset(axis=1)
     hr_offset_x, hr_offset_y = SCALE * lr_offset_x, SCALE * lr_offset_y
-    lr = lr[lr_offset_x:lr_offset_x + PATCH_SIZE_LR,
-            lr_offset_y:lr_offset_y + PATCH_SIZE_LR]
-    hr = hr[hr_offset_x:hr_offset_x + PATCH_SIZE_HR,
-            hr_offset_y:hr_offset_y + PATCH_SIZE_HR]
+    lr = lr[
+        lr_offset_x : lr_offset_x + PATCH_SIZE_LR,
+        lr_offset_y : lr_offset_y + PATCH_SIZE_LR,
+    ]
+    hr = hr[
+        hr_offset_x : hr_offset_x + PATCH_SIZE_HR,
+        hr_offset_y : hr_offset_y + PATCH_SIZE_HR,
+    ]
     return lr, hr
 
 
-#Data augmentions
+# Data augmentions
 def augment(lr: tf.Tensor, hr: tf.Tensor) -> Tuple[tf.Tensor, tf.Tensor]:
     u = tf.random.uniform(shape=())
     k = tf.random.uniform(shape=(), maxval=4, dtype=tf.dtypes.int32)
 
     def augment_(image: tf.Tensor) -> tf.Tensor:
-        image = tf.cond(u < 0.5, true_fn=lambda: image, false_fn=lambda: tf.image.flip_up_down(image))
+        image = tf.cond(
+            u < 0.5,
+            true_fn=lambda: image,
+            false_fn=lambda: tf.image.flip_up_down(image),
+        )
         return tf.image.rot90(image, k=k)
 
     return augment_(lr), augment_(hr)
 
 
-#Get many random patches for each image
+# Get many random patches for each image
 def patches(lr: tf.Tensor, hr: tf.Tensor) -> Tuple[List[tf.Tensor], List[tf.Tensor]]:
     tuples = (augment(*random_patch(lr, hr)) for _ in range(PATCHES_PER_IMAGE))
     lr, hr = zip(*tuples)
     return list(lr), list(hr)
+
 
 def scale_match(lr, hr):
     lr_shape = tf.shape(lr)  # [H, W, C]
@@ -132,52 +152,67 @@ def scale_match(lr, hr):
     )
 
     # Optional: skip "tiny" images
-    ok_min = tf.logical_and(lr_shape[0] > 2, lr_shape[1] > 2) & tf.logical_and(hr_shape[0] > 2, hr_shape[1] > 2)
+    ok_min = tf.logical_and(lr_shape[0] > 2, lr_shape[1] > 2) & tf.logical_and(
+        hr_shape[0] > 2, hr_shape[1] > 2
+    )
 
     return ok_rank & ok_pos & ok_c & ok_scale & ok_min
 
-#Generate INT8 TFLITE
-def generate_int8_tflite(model: tf.keras.Model,
-                         filename: str,
-                         path: Optional[str] = '/tmp',
-                         fake_quant: bool = False) -> str:
-    saved_model = path + '/' + filename
+
+# Generate INT8 TFLITE
+def generate_int8_tflite(
+    model: tf.keras.Model,
+    filename: str,
+    path: Optional[str] = "/tmp",
+    fake_quant: bool = False,
+) -> str:
+    saved_model = path + "/" + filename
     model.save(saved_model)
     converter = tf.compat.v1.lite.TFLiteConverter.from_saved_model(saved_model)
     converter.inference_type = tf.dtypes.int8
     if fake_quant:  # give some default ranges for activations (for perf-eval only)
-        converter.default_ranges_stats = (-6., 6.)
+        converter.default_ranges_stats = (-6.0, 6.0)
     input_arrays = converter.get_input_arrays()
     # if input node has fake-quant node, then the following ranges would be
     # overridden by fake-quant ranges.
-    converter.quantized_input_stats = {input_arrays[0]: (0., 1.)}
+    converter.quantized_input_stats = {input_arrays[0]: (0.0, 1.0)}
     converter.target_spec.supported_ops = [
-      tf.lite.OpsSet.TFLITE_BUILTINS, # enable TensorFlow Lite ops.
-      tf.lite.OpsSet.SELECT_TF_OPS # enable TensorFlow ops.
+        tf.lite.OpsSet.TFLITE_BUILTINS,  # enable TensorFlow Lite ops.
+        tf.lite.OpsSet.SELECT_TF_OPS,  # enable TensorFlow ops.
     ]
     tflite_model = converter.convert()
 
     if not os.path.exists(path):
         os.makedirs(path)
-    tflite_filename = path + '/' + filename + '.tflite'
-    with open(tflite_filename, 'wb') as f:
+    tflite_filename = path + "/" + filename + ".tflite"
+    with open(tflite_filename, "wb") as f:
         f.write(tflite_model)
 
     return tflite_filename
 
-def load_custom_dataset(data_dir: str, split: str = 'train', hr_folder_suffix: str = '', lr_folder_suffix: str = '', hr_file_suffix: str = '', lr_file_suffix: str = '') -> tf.data.Dataset:
-    """Load a custom SR dataset from folder structure."""
-    print(f"{Fore.CYAN}Loading dataset from {data_dir}, split: {split}, hr_suffix: {hr_folder_suffix}, lr_suffix: {lr_folder_suffix}")
 
-    lr_dir = os.path.join(data_dir, split, 'lr', lr_folder_suffix)
-    hr_dir = os.path.join(data_dir, split, 'hr', hr_folder_suffix)
+def load_custom_dataset(
+    data_dir: str,
+    split: str = "train",
+    hr_folder_suffix: str = "",
+    lr_folder_suffix: str = "",
+    hr_file_suffix: str = "",
+    lr_file_suffix: str = "",
+) -> tf.data.Dataset:
+    """Load a custom SR dataset from folder structure."""
+    print(
+        f"{Fore.CYAN}Loading dataset from {data_dir}, split: {split}, hr_suffix: {hr_folder_suffix}, lr_suffix: {lr_folder_suffix}"
+    )
+
+    lr_dir = os.path.join(data_dir, split, "lr", lr_folder_suffix)
+    hr_dir = os.path.join(data_dir, split, "hr", hr_folder_suffix)
 
     hr_files = []
     lr_files = []
 
-    for hr_file in sorted(tf.io.gfile.glob(os.path.join(hr_dir, '*'))):
+    for hr_file in sorted(tf.io.gfile.glob(os.path.join(hr_dir, "*"))):
         hr_filename = os.path.basename(hr_file)
-        if hr_file_suffix != '':
+        if hr_file_suffix != "":
             lr_filename = hr_filename.replace(hr_file_suffix, lr_file_suffix)
         else:
             lr_filename = Path(hr_file).stem + lr_file_suffix + Path(hr_file).suffix
@@ -186,7 +221,9 @@ def load_custom_dataset(data_dir: str, split: str = 'train', hr_folder_suffix: s
             lr_files.append(lr_path)
             hr_files.append(hr_file)
         else:
-            print(f"{Fore.RED}WARNING: LR file not found for HR file {hr_file}: expected {lr_path}. This pair will be skipped.")
+            print(
+                f"{Fore.RED}WARNING: LR file not found for HR file {hr_file}: expected {lr_path}. This pair will be skipped."
+            )
 
     if len(lr_files) != len(hr_files):
         print(f"{Fore.RED}WARNING: Mismatch in number of LR and HR images!")
@@ -197,18 +234,23 @@ def load_custom_dataset(data_dir: str, split: str = 'train', hr_folder_suffix: s
         lr = tf.image.decode_image(lr, channels=3, expand_animations=False)
         hr = tf.io.read_file(hr_path)
         hr = tf.image.decode_image(hr, channels=3, expand_animations=False)
-        return {'lr': lr, 'hr': hr}
+        return {"lr": lr, "hr": hr}
 
     dataset = tf.data.Dataset.from_tensor_slices((lr_files, hr_files))
     dataset = dataset.map(load_image_pair, num_parallel_calls=tf.data.AUTOTUNE)
     return dataset
 
-def load_hr_only_dataset(data_dir: str, split: str = 'train', scale: int = 2, hr_suffix: str = '') -> tf.data.Dataset:
-    """Load dataset from HR images only, generating LR via bicubic downsampling."""
-    print(f"{Fore.CYAN}Loading HR-only dataset from {data_dir}, split: {split}, scale: {scale}, hr_suffix: {hr_suffix}")
 
-    hr_dir = os.path.join(data_dir, split, 'hr', hr_suffix)
-    hr_files = sorted(tf.io.gfile.glob(os.path.join(hr_dir, '*')))
+def load_hr_only_dataset(
+    data_dir: str, split: str = "train", scale: int = 2, hr_suffix: str = ""
+) -> tf.data.Dataset:
+    """Load dataset from HR images only, generating LR via bicubic downsampling."""
+    print(
+        f"{Fore.CYAN}Loading HR-only dataset from {data_dir}, split: {split}, scale: {scale}, hr_suffix: {hr_suffix}"
+    )
+
+    hr_dir = os.path.join(data_dir, split, "hr", hr_suffix)
+    hr_files = sorted(tf.io.gfile.glob(os.path.join(hr_dir, "*")))
 
     def load_and_downsample(hr_path):
         hr = tf.io.read_file(hr_path)
@@ -222,14 +264,15 @@ def load_hr_only_dataset(data_dir: str, split: str = 'train', scale: int = 2, hr
         hr = hr[:h, :w, :]
 
         # Downsample to create LR
-        lr = tf.image.resize(hr, [h // scale, w // scale], method='bicubic')
+        lr = tf.image.resize(hr, [h // scale, w // scale], method="bicubic")
         lr = tf.clip_by_value(lr, 0, 255)
 
-        return {'lr': tf.cast(lr, tf.uint8), 'hr': tf.cast(hr, tf.uint8)}
+        return {"lr": tf.cast(lr, tf.uint8), "hr": tf.cast(hr, tf.uint8)}
 
     dataset = tf.data.Dataset.from_tensor_slices(hr_files)
     dataset = dataset.map(load_and_downsample, num_parallel_calls=tf.data.AUTOTUNE)
     return dataset
+
 
 class LPIPSLoss:
     """
@@ -243,15 +286,19 @@ class LPIPSLoss:
         - net='mobilenetv2' -> MobileNetV2 (ImageNet) feature loss (lightweight)
     """
 
-    def __init__(self, net='mobilenetv2', use_gpu=True,
-                 layer_weights=None,
-                 eps=1e-10,
-                 use_mixed_precision=False):
+    def __init__(
+        self,
+        net="mobilenetv2",
+        use_gpu=True,
+        layer_weights=None,
+        eps=1e-10,
+        use_mixed_precision=False,
+    ):
         self.net = net.lower()
         self.eps = tf.constant(eps, tf.float32)
         self.use_mixed_precision = use_mixed_precision
 
-        if self.net == 'vgg':
+        if self.net == "vgg":
             layer_names = [
                 "block1_conv2",
                 "block2_conv2",
@@ -263,7 +310,7 @@ class LPIPSLoss:
                 layer_weights = [1.0, 1.0, 1.0, 1.0, 1.0]
             self._build_vgg16(layer_names)
 
-        elif self.net == 'mobilenetv2':
+        elif self.net == "mobilenetv2":
             layer_names = [
                 "block_1_expand_relu",
                 "block_3_expand_relu",
@@ -293,7 +340,9 @@ class LPIPSLoss:
         base = tf.keras.applications.MobileNetV2(include_top=False, weights="imagenet")
         base.trainable = False
         outs = [base.get_layer(n).output for n in layer_names]
-        self.feature_model = tf.keras.Model(base.input, outs, name="mobilenetv2_features")
+        self.feature_model = tf.keras.Model(
+            base.input, outs, name="mobilenetv2_features"
+        )
         self.feature_model.trainable = False
         self._preprocess = self._preprocess_mobilenetv2
 
@@ -364,20 +413,20 @@ class LPIPSMetric:
     PyTorch LPIPS wrapper for TensorFlow/Y-channel.
     """
 
-    def __init__(self, net='alex', use_gpu=False):
+    def __init__(self, net="alex", use_gpu=False):
         """
         Args:
             net: 'alex', 'vgg', or 'squeeze'
             use_gpu: Use GPU if available
         """
         self.net = net
-        self.device = 'cuda' if use_gpu and torch.cuda.is_available() else 'cpu'
+        self.device = "cuda" if use_gpu and torch.cuda.is_available() else "cpu"
 
         # Initialize LPIPS model
         self.loss_fn = lpips.LPIPS(net=net).to(self.device)
         self.loss_fn.eval()  # Set to evaluation mode
 
-        if self.device == 'cuda':
+        if self.device == "cuda":
             torch.backends.cudnn.benchmark = True
 
     @torch.no_grad()  # Decorator for no gradient tracking
@@ -401,14 +450,18 @@ class LPIPSMetric:
         elif y_true_np.shape[-1] == 3:
             y_true_rgb = y_true_np
         else:
-            raise ValueError(f"Expected y_true to have 1 or 3 channels, got {y_true_np.shape[-1]}")
+            raise ValueError(
+                f"Expected y_true to have 1 or 3 channels, got {y_true_np.shape[-1]}"
+            )
 
         if y_pred_np.shape[-1] == 1:
             y_pred_rgb = np.repeat(y_pred_np, 3, axis=-1)
         elif y_pred_np.shape[-1] == 3:
             y_pred_rgb = y_pred_np
         else:
-            raise ValueError(f"Expected y_pred to have 1 or 3 channels, got {y_pred_np.shape[-1]}")
+            raise ValueError(
+                f"Expected y_pred to have 1 or 3 channels, got {y_pred_np.shape[-1]}"
+            )
 
         # Convert to PyTorch format: [B, H, W, C] -> [B, C, H, W]
         y_true_rgb = np.transpose(y_true_rgb, (0, 3, 1, 2))
@@ -445,9 +498,7 @@ class LPIPSMetric:
         """
         # Use tf.py_function to call PyTorch code
         lpips_value = tf.py_function(
-            func=self._compute_lpips_numpy,
-            inp=[y_true, y_pred],
-            Tout=tf.float32
+            func=self._compute_lpips_numpy, inp=[y_true, y_pred], Tout=tf.float32
         )
 
         return tf.stop_gradient(tf.reshape(lpips_value, []))
