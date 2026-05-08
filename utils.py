@@ -264,7 +264,7 @@ def load_hr_only_dataset(
         hr = hr[:h, :w, :]
 
         # Downsample to create LR
-        lr = tf.image.resize(hr, [h // scale, w // scale], method="bicubic")
+        lr = tf.image.resize(hr, [h // scale, w // scale], method="bicubic", antialias=True)
         lr = tf.clip_by_value(lr, 0, 255)
 
         return {"lr": tf.cast(lr, tf.uint8), "hr": tf.cast(hr, tf.uint8)}

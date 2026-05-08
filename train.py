@@ -40,8 +40,10 @@ tf.compat.v1.flags.DEFINE_bool("eval_only", False, "Run validation only (no trai
 tf.compat.v1.flags.DEFINE_string(
     "model_path", "", "Path to trained model for evaluation"
 )
+tf.compat.v1.flags.DEFINE_bool("lr_scheduler", True, "Use cosine learning rate scheduler")
+tf.compat.v1.flags.DEFINE_string('pixel_loss', 'charbonnier', "Pixel loss type: 'l1' or 'charbonnier'")
 tf.compat.v1.flags.DEFINE_bool(
-    "comb_loss", False, "Use combined L1 + LPIPS loss instead of just L1"
+    "comb_loss", False, "Use combined Pixel_Loss + LPIPS loss instead of just Pixel_Loss"
 )
 
 # OPTIMIZATION FLAGS
@@ -65,7 +67,7 @@ elif FLAGS.scale == 4:
     DATASET_NAME = "div2k/bicubic_x4"
 else:
     DATASET_NAME = None  # non-standard scale: must use CUSTOM_DATASET
-CUSTOM_DATASET = True  # Set to True to use custom dataset instead of DIV2K
+CUSTOM_DATASET = False  # Set to True to use custom dataset instead of DIV2K
 DEGRADATION_METHOD: Literal["simple", "bsrgan", "bicubic"] = (
     "bicubic"  # Set degradation method for custom dataset
 )
@@ -88,10 +90,11 @@ if (
         PATH_2X = (
             "logs/x2_models/"
             + FLAGS.model_name
-            + "_m{}_f{}_x2_fs{}{}{}_{}Training_{}{}".format(
+            + "_m{}_f{}_x2_fs{}_{}{}{}_{}Training_{}{}".format(
                 FLAGS.m,
                 FLAGS.int_features,
                 FLAGS.feature_size,
+                FLAGS.pixel_loss,
                 "_relu" if FLAGS.relu_act else "",
                 "_comb" if FLAGS.comb_loss else "",
                 FLAGS.linear_block_type,
@@ -167,11 +170,11 @@ def main(unused_argv):
         utils.rgb_to_y, num_parallel_calls=tf.data.AUTOTUNE
     )
     dataset_train = dataset_train.filter(utils.scale_match)
+    dataset_train = dataset_train.cache()
     dataset_train = dataset_train.map(
         utils.patches, num_parallel_calls=tf.data.AUTOTUNE
     )
     dataset_train = dataset_train.unbatch()
-    dataset_train = dataset_train.cache()
     dataset_train = dataset_train.shuffle(buffer_size=10_000)
     dataset_train = dataset_train.batch(FLAGS.batch_size)
     dataset_train = dataset_train.prefetch(buffer_size=tf.data.AUTOTUNE)
@@ -209,24 +212,30 @@ def main(unused_argv):
         loss = tf.reduce_mean(tf.abs(y_true - y_pred))
         return tf.cast(loss, tf.float32)
 
+    @tf.function
+    def charbonnier_loss(y_true: tf.Tensor, y_pred: tf.Tensor) -> tf.Tensor:
+        epsilon = 1e-3
+        loss = tf.reduce_mean(tf.sqrt(tf.square(y_true - y_pred) + epsilon ** 2))
+        return tf.cast(loss, tf.float32)
+
     # Perceptual loss is always computed via TF
     @tf.function
     def perceptual_loss(y_true: tf.Tensor, y_pred: tf.Tensor) -> tf.Tensor:
         loss = lpips_loss(y_true, y_pred)
         return tf.cast(loss, tf.float32)
 
-    # Combined loss: L1 + LPIPS
+    # Combined loss: Pixel_Loss + LPIPS
     @tf.function
     def combined_loss(y_true: tf.Tensor, y_pred: tf.Tensor) -> tf.Tensor:
-        l1 = l1_loss(y_true, y_pred)
+        pixel_loss = charbonnier_loss(y_true, y_pred) if FLAGS.pixel_loss == 'charbonnier' else l1_loss(y_true, y_pred)
         p = tf.cond(
             lpips_weight_var > 1e-6,
             true_fn=lambda: perceptual_loss(y_true, y_pred),
             false_fn=lambda: tf.constant(0.0),
         )
-        l1 = tf.cast(l1, tf.float32)
+        pixel_loss = tf.cast(pixel_loss, tf.float32)
         p = tf.cast(p, tf.float32)
-        return l1 + lpips_weight_var * p
+        return pixel_loss + lpips_weight_var * p
 
     if FLAGS.eval_only:
         print(f"{Fore.CYAN}Running validation only...")
@@ -240,7 +249,7 @@ def main(unused_argv):
             custom_objects={
                 "psnr": psnr,
                 "lpips": lpips,
-                "l1_loss": l1_loss,
+                "pixel_loss": charbonnier_loss if FLAGS.pixel_loss == 'charbonnier' else l1_loss,
                 "perceptual_loss": perceptual_loss,
                 "combined_loss": combined_loss,
             },
@@ -274,9 +283,22 @@ def main(unused_argv):
             mode="train",
         )
 
+    if FLAGS.lr_scheduler:
+        # Define the learning rate scheduler
+        steps_per_epoch = sum(1 for _ in dataset_train)
+        total_steps = steps_per_epoch * FLAGS.epochs
+
+        # Cosine decay from initial LR down to alpha * initial LR
+        lr_schedule = tf.keras.optimizers.schedules.CosineDecay(
+            initial_learning_rate=FLAGS.learning_rate,
+            decay_steps=total_steps,
+            alpha=0.005,  # final LR = 0.005 * 2e-4 = 1e-6
+        )
+
     # Declare the optimizer.
     optimizer = tf.keras.optimizers.Adam(
-        learning_rate=FLAGS.learning_rate, amsgrad=True
+        learning_rate=lr_schedule if FLAGS.lr_scheduler else FLAGS.learning_rate,
+        amsgrad=True,
     )
 
     # Use loss scaling for mixed precision.
@@ -294,7 +316,7 @@ def main(unused_argv):
                 custom_objects={
                     "psnr": psnr,
                     "lpips": lpips,
-                    "l1_loss": l1_loss,
+                    "pixel_loss": charbonnier_loss if FLAGS.pixel_loss == 'charbonnier' else l1_loss,
                     "perceptual_loss": perceptual_loss,
                     "combined_loss": combined_loss,
                 },
@@ -308,7 +330,7 @@ def main(unused_argv):
                 custom_objects={
                     "psnr": psnr,
                     "lpips": lpips,
-                    "l1_loss": l1_loss,
+                    "pixel_loss": charbonnier_loss if FLAGS.pixel_loss == 'charbonnier' else l1_loss,
                     "perceptual_loss": perceptual_loss,
                     "combined_loss": combined_loss,
                 },
@@ -333,7 +355,7 @@ def main(unused_argv):
                 custom_objects={
                     "psnr": psnr,
                     "lpips": lpips,
-                    "l1_loss": l1_loss,
+                    "pixel_loss": charbonnier_loss if FLAGS.pixel_loss == 'charbonnier' else l1_loss,
                     "perceptual_loss": perceptual_loss,
                     "combined_loss": combined_loss,
                 },
@@ -341,19 +363,25 @@ def main(unused_argv):
 
     # Compile the model.
     if FLAGS.comb_loss:
-        print(f"{Fore.CYAN}Using combined L1 + LPIPS loss for training.")
+        pix_loss_name = FLAGS.pixel_loss
+        print(f"{Fore.CYAN}Using combined {pix_loss_name.upper()} + LPIPS loss for training.")
+        pix_metric = charbonnier_loss if FLAGS.pixel_loss == 'charbonnier' else l1_loss
         if FLAGS.skip_lpips_metric:
-            compile_metrics = [l1_loss, perceptual_loss, psnr]
+            compile_metrics = [pix_metric, perceptual_loss, psnr]
         else:
-            compile_metrics = [l1_loss, perceptual_loss, psnr, lpips]
+            compile_metrics = [pix_metric, perceptual_loss, psnr, lpips]
         loss_function = combined_loss
     else:
-        print(f"{Fore.CYAN}Using L1 loss for training.")
+        if FLAGS.pixel_loss == 'charbonnier':
+            print(f"{Fore.CYAN}Using Charbonnier loss for training.")
+            loss_function = charbonnier_loss
+        else:
+            print(f"{Fore.CYAN}Using L1 loss for training.")
+            loss_function = "mae"
         if FLAGS.skip_lpips_metric:
             compile_metrics = [psnr]
         else:
             compile_metrics = [psnr, lpips]
-        loss_function = "mae"
 
     model.compile(
         optimizer=optimizer,
@@ -414,12 +442,13 @@ def main(unused_argv):
 
     log_dir = os.path.join(
         "tensorboard_logs",
-        "{}_m{}_f{}_x{}_fs{}{}{}_{}Training_{}{}".format(
+        "{}_m{}_f{}_x{}_fs{}_{}{}{}_{}Training_{}{}".format(
             FLAGS.model_name,
             FLAGS.m,
             FLAGS.int_features,
             FLAGS.scale,
             FLAGS.feature_size,
+            FLAGS.pixel_loss,
             "_relu" if FLAGS.relu_act else "",
             "_comb" if FLAGS.comb_loss else "",
             FLAGS.linear_block_type,
@@ -435,14 +464,14 @@ def main(unused_argv):
     )
 
     callbacks.append(tensorboard_callback)
-    callbacks.append(
-        AdaptiveLPIPSScheduler(
-            start_weight=0.001,
-            end_weight=0.05,
-            start_epoch=10,
-            ramp_epochs=FLAGS.epochs - 20,
-        )
-    )
+    # callbacks.append(
+    #     AdaptiveLPIPSScheduler(
+    #         start_weight=0.001,
+    #         end_weight=0.05,
+    #         start_epoch=10,
+    #         ramp_epochs=FLAGS.epochs - 20,
+    #     )
+    # )
 
     # Train the model
     print(f"{Fore.GREEN}Starting training with optimizations:")
@@ -454,7 +483,7 @@ def main(unused_argv):
         dataset_train,
         epochs=FLAGS.epochs,
         validation_data=dataset_validation,
-        validation_freq=5,
+        validation_freq=1,
         callbacks=callbacks,
     )
     model.summary()
@@ -464,11 +493,12 @@ def main(unused_argv):
         final_save_path = (
             BASE_SAVE_DIR
             + FLAGS.model_name
-            + "_m{}_f{}_x{}_fs{}{}{}_{}Training_{}{}".format(
+            + "_m{}_f{}_x{}_fs{}_{}{}{}_{}Training_{}{}".format(
                 FLAGS.m,
                 FLAGS.int_features,
                 FLAGS.scale,
                 FLAGS.feature_size,
+                FLAGS.pixel_loss,
                 "_relu" if FLAGS.relu_act else "",
                 "_comb" if FLAGS.comb_loss else "",
                 FLAGS.linear_block_type,

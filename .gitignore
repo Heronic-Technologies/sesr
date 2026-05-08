@@ -11,3 +11,7 @@
 # Temp files
 *.swp
 *.swo
+
+logs/
+datasets/
+tensorboard_logs/
